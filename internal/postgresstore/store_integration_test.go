@@ -222,6 +222,30 @@ func TestStoreRecordTerminalIsIdempotent(t *testing.T) {
 	if actionStatus != "SUCCEEDED" || finalEventState != string(moderation.ProcessedAction) {
 		t.Fatalf("action/event status = %q/%q", actionStatus, finalEventState)
 	}
+	if err := store.RecordTerminal(ctx, event, outcome); err != nil {
+		t.Fatalf("record event replay after completed action: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT terminal_state FROM moderation_events WHERE event_id = $1`, event.EventID).Scan(&finalEventState); err != nil {
+		t.Fatal(err)
+	}
+	if finalEventState != string(moderation.ProcessedAction) {
+		t.Fatalf("replayed event state = %q, want completed action preserved", finalEventState)
+	}
+	outcome.Decision.RiskScore = 1
+	outcome.Decision.RecommendedAction = moderation.ActionBanUser
+	outcome.Decision.AuthorizedAction = moderation.ActionBanUser
+	outcome.Action.Type = moderation.ActionBanUser
+	outcome.Action.IdempotencyKey = "ban:-100777:42:82373d0f-5740-5f07-b4e8-02c2f4edd824"
+	if err := store.RecordTerminal(ctx, event, outcome); err != nil {
+		t.Fatalf("record changed replayed decision: %v", err)
+	}
+	var storedActionType string
+	if err := pool.QueryRow(ctx, `SELECT count(*), min(action_type) FROM moderation_actions WHERE event_id = $1`, event.EventID).Scan(&actionCount, &storedActionType); err != nil {
+		t.Fatal(err)
+	}
+	if actionCount != 1 || storedActionType != string(moderation.ActionDeleteMessage) {
+		t.Fatalf("changed replay created action: count/type = %d/%q", actionCount, storedActionType)
+	}
 }
 
 func TestStoreObserveMessageCountsDuplicateAndFlood(t *testing.T) {
@@ -295,7 +319,7 @@ func TestStorePersistsCommunityPolicyAllowlistAndReportIdempotently(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if policy.ProtectionLevel != "OBSERVE" || policy.AutomaticActionsEnabled || !policy.IsAllowlisted {
+	if policy.ProtectionLevel != "OBSERVE" || policy.AutomaticActionsEnabled || policy.AutobanEnabled || !policy.IsAllowlisted {
 		t.Fatalf("policy = %#v", policy)
 	}
 	for range 2 {

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -51,7 +52,7 @@ func NewClient(config ClientConfig) (*Client, error) {
 		baseURL = "https://api.telegram.org"
 	}
 	parsedURL, err := url.Parse(baseURL)
-	if err != nil || parsedURL.Scheme == "" || parsedURL.Host == "" {
+	if err != nil || !safeAPIBaseURL(parsedURL) {
 		return nil, fmt.Errorf("Telegram API base URL is invalid")
 	}
 	httpClient := config.HTTPClient
@@ -64,6 +65,20 @@ func NewClient(config ClientConfig) (*Client, error) {
 		baseURL:    strings.TrimRight(baseURL, "/"),
 		httpClient: httpClient,
 	}, nil
+}
+
+func safeAPIBaseURL(value *url.URL) bool {
+	if value == nil || value.Host == "" {
+		return false
+	}
+	if value.Scheme == "https" {
+		return true
+	}
+	if value.Scheme != "http" {
+		return false
+	}
+	host := value.Hostname()
+	return host == "localhost" || (net.ParseIP(host) != nil && net.ParseIP(host).IsLoopback())
 }
 
 // FetchProfile gets a user's bio, personal channel metadata, and five recent
@@ -137,6 +152,28 @@ func (c *Client) BanChatMember(ctx context.Context, chatID, userID int64) error 
 	}
 	if !banned {
 		return fmt.Errorf("ban Telegram chat member: Telegram returned false")
+	}
+	return nil
+}
+
+// UnbanChatMember reverses a previous ban without forcing the user to rejoin.
+func (c *Client) UnbanChatMember(ctx context.Context, chatID, userID int64) error {
+	if chatID == 0 {
+		return fmt.Errorf("Telegram chat ID must not be zero")
+	}
+	if userID <= 0 {
+		return fmt.Errorf("Telegram user ID must be positive")
+	}
+	var unbanned bool
+	if err := c.call(ctx, "unbanChatMember", struct {
+		ChatID       int64 `json:"chat_id"`
+		UserID       int64 `json:"user_id"`
+		OnlyIfBanned bool  `json:"only_if_banned"`
+	}{ChatID: chatID, UserID: userID, OnlyIfBanned: true}, &unbanned); err != nil {
+		return fmt.Errorf("unban Telegram chat member: %w", err)
+	}
+	if !unbanned {
+		return fmt.Errorf("unban Telegram chat member: Telegram returned false")
 	}
 	return nil
 }
@@ -231,6 +268,50 @@ func (c *Client) SendMessage(ctx context.Context, chatID int64, text string) err
 		return fmt.Errorf("send Telegram message: %w", err)
 	}
 	return nil
+}
+
+// SetWebhook registers all update types consumed by AntiSpamBee, including
+// reactions which Telegram excludes from the default subscription.
+func (c *Client) SetWebhook(ctx context.Context, webhookURL, secret string) error {
+	parsed, err := url.Parse(webhookURL)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
+		return fmt.Errorf("Telegram webhook URL must be an absolute HTTPS URL")
+	}
+	if !validWebhookSecret(secret) {
+		return fmt.Errorf("Telegram webhook secret must use 1-256 A-Z, a-z, 0-9, underscore, or hyphen characters")
+	}
+	var configured bool
+	if err := c.call(ctx, "setWebhook", struct {
+		URL            string   `json:"url"`
+		SecretToken    string   `json:"secret_token"`
+		AllowedUpdates []string `json:"allowed_updates"`
+	}{
+		URL: webhookURL, SecretToken: secret,
+		AllowedUpdates: []string{
+			"message", "edited_message", "channel_post", "edited_channel_post",
+			"callback_query", "message_reaction",
+		},
+	}, &configured); err != nil {
+		return fmt.Errorf("set Telegram webhook: %w", err)
+	}
+	if !configured {
+		return fmt.Errorf("set Telegram webhook: Telegram returned false")
+	}
+	return nil
+}
+
+func validWebhookSecret(secret string) bool {
+	if len(secret) == 0 || len(secret) > 256 {
+		return false
+	}
+	for _, r := range secret {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
+			(r >= '0' && r <= '9') || r == '_' || r == '-' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 // GetChatMemberStatus returns member, administrator, creator, restricted,

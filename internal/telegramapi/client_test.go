@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"slices"
 	"testing"
 
 	"antispambee/internal/detection"
@@ -135,6 +136,23 @@ func TestClientBanChatMember(t *testing.T) {
 
 	if requestBody.ChatID != -100777 || requestBody.UserID != 42 {
 		t.Fatalf("request body = %#v", requestBody)
+	}
+}
+
+func TestClientUnbanChatMember(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/botsecret/unbanChatMember" {
+			t.Fatalf("path = %q", r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"ok":true,"result":true}`))
+	}))
+	defer server.Close()
+	client, err := NewClient(ClientConfig{Token: "secret", BaseURL: server.URL, HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.UnbanChatMember(context.Background(), -100777, 42); err != nil {
+		t.Fatalf("UnbanChatMember() error = %v", err)
 	}
 }
 
@@ -272,5 +290,33 @@ func TestClientSendMessage(t *testing.T) {
 	}
 	if err := client.SendMessage(context.Background(), -100123, "готово"); err != nil {
 		t.Fatalf("SendMessage() error = %v", err)
+	}
+}
+
+func TestClientSetWebhookIncludesReactionUpdates(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/botsecret/setWebhook" {
+			t.Fatalf("path = %q", r.URL.Path)
+		}
+		var request struct {
+			URL            string   `json:"url"`
+			SecretToken    string   `json:"secret_token"`
+			AllowedUpdates []string `json:"allowed_updates"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		if request.URL != "https://bot.example/webhook" || request.SecretToken != "webhook-secret" || !slices.Contains(request.AllowedUpdates, "message_reaction") {
+			t.Fatalf("request = %#v", request)
+		}
+		_, _ = w.Write([]byte(`{"ok":true,"result":true}`))
+	}))
+	defer server.Close()
+	client, err := NewClient(ClientConfig{Token: "secret", BaseURL: server.URL, HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.SetWebhook(context.Background(), "https://bot.example/webhook", "webhook-secret"); err != nil {
+		t.Fatalf("SetWebhook() error = %v", err)
 	}
 }

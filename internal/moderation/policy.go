@@ -4,5 +4,6 @@ package moderation
 type CommunityPolicy struct {
 	ProtectionLevel         string
 	AutomaticActionsEnabled bool
+	AutobanEnabled          bool
 	IsAllowlisted           bool
 }

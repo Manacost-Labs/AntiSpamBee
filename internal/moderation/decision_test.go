@@ -70,6 +70,16 @@ func TestDecisionEngineReviewsWhenTargetCannotBeModerated(t *testing.T) {
 	}
 }
 
+func TestDecisionEngineReviewsCertainRiskWithoutTarget(t *testing.T) {
+	engine := NewDecisionEngine()
+	decision := engine.Decide(DecisionInput{
+		Signals: []detection.Signal{availableSignal("profile.rules", 1, 1, 1)},
+	})
+	if decision.AuthorizedAction != ActionReview {
+		t.Fatalf("authorized action = %q, want REVIEW", decision.AuthorizedAction)
+	}
+}
+
 func TestDecisionEngineNeverActsOnProtectedMember(t *testing.T) {
 	engine := NewDecisionEngine()
 
@@ -95,6 +105,18 @@ func TestDecisionEngineRespectsDisabledAutomaticActions(t *testing.T) {
 		Signals:                  []detection.Signal{availableSignal("message.rules", 1, 1, 1)},
 	})
 	if decision.AuthorizedAction != ActionReview || decision.AuthorizationReason != ReasonAutomaticActionsDisabled {
+		t.Fatalf("decision = %#v", decision)
+	}
+}
+
+func TestDecisionEngineDowngradesBanWhenAutobanDisabled(t *testing.T) {
+	engine := NewDecisionEngine()
+	decision := engine.Decide(DecisionInput{
+		Target:          ActionTarget{Kind: TargetMessage, ChatID: -1001, UserID: 42, MessageID: 7},
+		AutobanDisabled: true,
+		Signals:         []detection.Signal{availableSignal("message.rules", 1, 1, 1)},
+	})
+	if decision.RecommendedAction != ActionBanUser || decision.AuthorizedAction != ActionDeleteMessage || decision.AuthorizationReason != ReasonAutobanDisabled {
 		t.Fatalf("decision = %#v", decision)
 	}
 }

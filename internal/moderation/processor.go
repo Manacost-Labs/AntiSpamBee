@@ -189,6 +189,7 @@ func (p *Processor) Process(ctx context.Context, event events.TelegramUpdate) er
 	preliminary := p.decisions.Decide(DecisionInput{Target: actionTarget, Signals: signals})
 	isProtected := false
 	automaticActionsDisabled := false
+	autobanDisabled := false
 	if isAutomaticAction(preliminary.AuthorizedAction) {
 		if p.policyStore != nil {
 			policy, err := p.policyStore.GetCommunityPolicy(ctx, event.TenantID, target.ChatID, target.UserID)
@@ -197,6 +198,7 @@ func (p *Processor) Process(ctx context.Context, event events.TelegramUpdate) er
 			} else {
 				isProtected = policy.IsAllowlisted
 				automaticActionsDisabled = !policy.AutomaticActionsEnabled || policy.ProtectionLevel == "OBSERVE"
+				autobanDisabled = !policy.AutobanEnabled
 			}
 		}
 		if !isProtected {
@@ -213,6 +215,7 @@ func (p *Processor) Process(ctx context.Context, event events.TelegramUpdate) er
 		Signals:                  signals,
 		IsProtected:              isProtected,
 		AutomaticActionsDisabled: automaticActionsDisabled,
+		AutobanDisabled:          autobanDisabled,
 	})
 	state := terminalStateFor(decision.AuthorizedAction)
 	var action *ActionRequest

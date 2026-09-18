@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -46,7 +47,7 @@ func NewClient(config ClientConfig) (*Client, error) {
 		baseURL = defaultBaseURL
 	}
 	parsedURL, err := url.Parse(baseURL)
-	if err != nil || parsedURL.Scheme == "" || parsedURL.Host == "" {
+	if err != nil || !safeAPIBaseURL(parsedURL) {
 		return nil, fmt.Errorf("OpenRouter base URL is invalid")
 	}
 	model := config.Model
@@ -64,6 +65,20 @@ func NewClient(config ClientConfig) (*Client, error) {
 		httpClient: httpClient,
 		now:        time.Now,
 	}, nil
+}
+
+func safeAPIBaseURL(value *url.URL) bool {
+	if value == nil || value.Host == "" {
+		return false
+	}
+	if value.Scheme == "https" {
+		return true
+	}
+	if value.Scheme != "http" {
+		return false
+	}
+	host := value.Hostname()
+	return host == "localhost" || (net.ParseIP(host) != nil && net.ParseIP(host).IsLoopback())
 }
 
 // AnalyzeAdvertising returns a shadow detector signal and never performs an

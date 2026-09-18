@@ -17,6 +17,7 @@ const (
 	ActionDeleteReaction ActionType = "DELETE_REACTION"
 	ActionBanUser        ActionType = "BAN_USER"
 	ActionMuteUser       ActionType = "MUTE_USER"
+	ActionUnbanUser      ActionType = "UNBAN_USER"
 )
 
 // TargetKind describes the Telegram object that can be moderated.
@@ -34,6 +35,7 @@ const (
 	ReasonNoActionableTarget       = "NO_ACTIONABLE_TARGET"
 	ReasonProtectedMember          = "PROTECTED_MEMBER"
 	ReasonAutomaticActionsDisabled = "AUTOMATIC_ACTIONS_DISABLED"
+	ReasonAutobanDisabled          = "AUTOBAN_DISABLED"
 	ReasonCertainAdvertising       = "CERTAIN_ADVERTISING"
 	ReasonLikelyAdvertising        = "LIKELY_ADVERTISING"
 )
@@ -64,6 +66,7 @@ type DecisionInput struct {
 	Signals                  []detection.Signal
 	IsProtected              bool
 	AutomaticActionsDisabled bool
+	AutobanDisabled          bool
 }
 
 // Decision separates detector recommendation from policy authorization.
@@ -121,6 +124,16 @@ func (e *DecisionEngine) Decide(input DecisionInput) Decision {
 		decision.AuthorizationReason = ReasonAutomaticActionsDisabled
 		return decision
 	}
+	if input.AutobanDisabled && recommendedAction(decision.RiskScore, input.Target.Kind) == ActionBanUser {
+		decision.RecommendedAction = ActionBanUser
+		if input.Target.Kind == TargetReaction {
+			decision.AuthorizedAction = ActionDeleteReaction
+		} else {
+			decision.AuthorizedAction = ActionDeleteMessage
+		}
+		decision.AuthorizationReason = ReasonAutobanDisabled
+		return decision
+	}
 
 	decision.RecommendedAction = recommendedAction(decision.RiskScore, input.Target.Kind)
 	decision.AuthorizedAction = decision.RecommendedAction
@@ -136,6 +149,9 @@ func (e *DecisionEngine) Decide(input DecisionInput) Decision {
 }
 
 func recommendedAction(score float64, kind TargetKind) ActionType {
+	if kind != TargetMessage && kind != TargetReaction {
+		return ActionReview
+	}
 	if score >= 1 {
 		return ActionBanUser
 	}
@@ -159,6 +175,8 @@ func actionIdempotencyKey(eventID string, action ActionType, target ActionTarget
 		return fmt.Sprintf("delete-message:%d:%d:%s", target.ChatID, target.MessageID, eventID)
 	case ActionMuteUser:
 		return fmt.Sprintf("mute:%d:%d:%s", target.ChatID, target.UserID, eventID)
+	case ActionUnbanUser:
+		return fmt.Sprintf("unban:%d:%d:%s", target.ChatID, target.UserID, eventID)
 	default:
 		return ""
 	}

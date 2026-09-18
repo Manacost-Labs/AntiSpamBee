@@ -49,6 +49,7 @@ type telegramStub struct {
 	messageDeletes    int
 	reactionDeletes   int
 	mutes             int
+	unbans            int
 }
 
 func (t *telegramStub) BanChatMember(context.Context, int64, int64) error {
@@ -68,6 +69,10 @@ func (t *telegramStub) GetChatMemberStatus(context.Context, int64, int64) (strin
 }
 func (t *telegramStub) RestrictChatMember(context.Context, int64, int64, int64) error {
 	t.mutes++
+	return nil
+}
+func (t *telegramStub) UnbanChatMember(context.Context, int64, int64) error {
+	t.unbans++
 	return nil
 }
 
@@ -94,6 +99,17 @@ func TestWorkerExecutesMute(t *testing.T) {
 	worked, err := worker.RunOnce(context.Background())
 	if err != nil || !worked || telegram.mutes != 1 || !repo.succeeded {
 		t.Fatalf("worked/error/mutes/succeeded = %v/%v/%d/%v", worked, err, telegram.mutes, repo.succeeded)
+	}
+}
+
+func TestWorkerExecutesUnban(t *testing.T) {
+	repo := &repositoryStub{found: true, action: claimedAction(moderation.ActionUnbanUser, 1)}
+	telegram := &telegramStub{}
+	worker := newTestWorker(t, repo, telegram)
+
+	worked, err := worker.RunOnce(context.Background())
+	if err != nil || !worked || telegram.unbans != 1 || !repo.succeeded {
+		t.Fatalf("worked/error/unbans/succeeded = %v/%v/%d/%v", worked, err, telegram.unbans, repo.succeeded)
 	}
 }
 

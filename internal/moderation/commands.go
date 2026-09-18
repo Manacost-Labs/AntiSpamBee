@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -100,14 +101,14 @@ func (r *CommandRouter) Process(ctx context.Context, event events.TelegramUpdate
 			return err
 		}
 		return r.telegram.SendMessage(ctx, command.ChatID, fmt.Sprintf(
-			"AntiSpamBee: уровень %s, автоматические действия: %t",
-			policy.ProtectionLevel, policy.AutomaticActionsEnabled,
+			"AntiSpamBee: уровень %s, автоматические действия: %t, автобан: %t",
+			policy.ProtectionLevel, policy.AutomaticActionsEnabled, policy.AutobanEnabled,
 		))
 	case "protection":
 		return r.handleProtection(ctx, event, command)
 	case "allow", "unallow":
 		return r.handleAllowlist(ctx, event, command, command.Name == "allow")
-	case "ban", "mute", "warn":
+	case "ban", "mute", "unban", "warn":
 		return r.handleModeratorAction(ctx, event, command)
 	default:
 		return r.fallback.Process(ctx, event)
@@ -213,21 +214,30 @@ func (r *CommandRouter) handleModeratorAction(ctx context.Context, event events.
 	} else if !ok {
 		return r.respondToInvalidCommand(ctx, event, command.ChatID, "Эта команда доступна только администраторам.")
 	}
-	if command.ReplyUserID <= 0 || command.ReplyMessageID <= 0 {
+	targetUserID := command.ReplyUserID
+	targetMessageID := command.ReplyMessageID
+	if command.Name == "unban" && targetUserID <= 0 {
+		parsed, err := strconv.ParseInt(command.Argument, 10, 64)
+		if err == nil && parsed > 0 {
+			targetUserID = parsed
+			targetMessageID = command.MessageID
+		}
+	}
+	if targetUserID <= 0 || targetMessageID <= 0 {
 		return r.respondToInvalidCommand(ctx, event, command.ChatID, "Ответьте этой командой на сообщение пользователя.")
 	}
-	status, err := r.telegram.GetChatMemberStatus(ctx, command.ChatID, command.ReplyUserID)
+	status, err := r.telegram.GetChatMemberStatus(ctx, command.ChatID, targetUserID)
 	if err != nil {
 		return err
 	}
-	if status == "administrator" || status == "creator" {
+	if command.Name != "unban" && (status == "administrator" || status == "creator") {
 		return r.respondToInvalidCommand(ctx, event, command.ChatID, "Нельзя применить действие к администратору или владельцу.")
 	}
 	if command.Name == "warn" {
 		if err := r.recordCommand(ctx, event, nil); err != nil {
 			return err
 		}
-		return r.telegram.SendMessage(ctx, command.ChatID, fmt.Sprintf("Предупреждение пользователю %d от модератора.", command.ReplyUserID))
+		return r.telegram.SendMessage(ctx, command.ChatID, fmt.Sprintf("Предупреждение пользователю %d от модератора.", targetUserID))
 	}
 	actionType := ActionBanUser
 	untilDate := int64(0)
@@ -235,9 +245,12 @@ func (r *CommandRouter) handleModeratorAction(ctx context.Context, event events.
 		actionType = ActionMuteUser
 		untilDate = r.now().Add(time.Hour).Unix()
 	}
+	if command.Name == "unban" {
+		actionType = ActionUnbanUser
+	}
 	target := ActionTarget{
 		Kind: TargetMessage, ChatID: command.ChatID,
-		UserID: command.ReplyUserID, MessageID: command.ReplyMessageID,
+		UserID: targetUserID, MessageID: targetMessageID,
 	}
 	action := &ActionRequest{
 		Type: actionType, Target: target, UntilDate: untilDate,
@@ -293,5 +306,5 @@ func (r *CommandRouter) recordCommand(ctx context.Context, event events.Telegram
 }
 
 func commandHelp() string {
-	return "AntiSpamBee активен. Команды: /report, /status, /protection, /allow, /unallow, /warn, /mute, /ban. Команды действий используйте ответом на сообщение."
+	return "AntiSpamBee активен. Команды: /report, /status, /protection, /allow, /unallow, /warn, /mute, /ban, /unban. Команды действий используйте ответом на сообщение."
 }

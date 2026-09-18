@@ -92,6 +92,8 @@ func (s *Store) ClaimAction(
 		action.Target.Kind = moderation.TargetMessage
 	case moderation.ActionMuteUser:
 		action.Target.Kind = moderation.TargetMessage
+	case moderation.ActionUnbanUser:
+		action.Target.Kind = moderation.TargetMessage
 	}
 	return action, true, nil
 }
@@ -272,17 +274,22 @@ func (s *Store) GetCommunityPolicy(
 		return moderation.CommunityPolicy{}, fmt.Errorf("valid tenant, chat, and user are required")
 	}
 	policy := moderation.CommunityPolicy{
-		ProtectionLevel:         "STANDARD",
+		ProtectionLevel:         "STRICT",
 		AutomaticActionsEnabled: true,
+		AutobanEnabled:          true,
 	}
 	err := s.pool.QueryRow(ctx, `
 		SELECT
 			COALESCE((
 				SELECT protection_level FROM community_policies
 				WHERE tenant_id = $1 AND chat_id = $2
-			), 'STANDARD'),
+			), 'STRICT'),
 			COALESCE((
 				SELECT automatic_actions_enabled FROM community_policies
+				WHERE tenant_id = $1 AND chat_id = $2
+			), TRUE),
+			COALESCE((
+				SELECT autoban_enabled FROM community_policies
 				WHERE tenant_id = $1 AND chat_id = $2
 			), TRUE),
 			EXISTS (
@@ -292,6 +299,7 @@ func (s *Store) GetCommunityPolicy(
 	`, tenantID, chatID, userID).Scan(
 		&policy.ProtectionLevel,
 		&policy.AutomaticActionsEnabled,
+		&policy.AutobanEnabled,
 		&policy.IsAllowlisted,
 	)
 	if err != nil {
@@ -307,17 +315,19 @@ func (s *Store) SetCommunityProtection(
 	chatID int64,
 	level string,
 ) error {
-	automaticActions := level != "OBSERVE"
+	automaticActions := level == "STANDARD" || level == "STRICT"
+	autoban := level == "STRICT"
 	command, err := s.pool.Exec(ctx, `
 		INSERT INTO community_policies (
-			tenant_id, chat_id, protection_level, automatic_actions_enabled
+			tenant_id, chat_id, protection_level, automatic_actions_enabled, autoban_enabled
 		)
-		VALUES ($1, $2, $3, $4)
+		VALUES ($1, $2, $3, $4, $5)
 		ON CONFLICT (tenant_id, chat_id) DO UPDATE
 		SET protection_level = EXCLUDED.protection_level,
 			automatic_actions_enabled = EXCLUDED.automatic_actions_enabled,
+			autoban_enabled = EXCLUDED.autoban_enabled,
 			updated_at = now()
-	`, tenantID, chatID, level, automaticActions)
+	`, tenantID, chatID, level, automaticActions, autoban)
 	if err != nil {
 		return fmt.Errorf("set community protection: %w", err)
 	}
@@ -417,7 +427,6 @@ func (s *Store) RecordTerminal(
 			AND moderation_events.bot_id = EXCLUDED.bot_id
 			AND moderation_events.telegram_update_id = EXCLUDED.telegram_update_id
 			AND moderation_events.schema_version = EXCLUDED.schema_version
-			AND moderation_events.terminal_state = EXCLUDED.terminal_state
 		RETURNING event_id::text
 	`,
 		event.EventID,
@@ -494,12 +503,6 @@ func (s *Store) RecordTerminal(
 		VALUES ($1, $1, $2, $3, $4, $5, $6, $7)
 		ON CONFLICT (event_id) DO UPDATE
 		SET event_id = EXCLUDED.event_id
-		WHERE moderation_decisions.risk_score = EXCLUDED.risk_score
-			AND moderation_decisions.decision_confidence = EXCLUDED.decision_confidence
-			AND moderation_decisions.evidence_coverage = EXCLUDED.evidence_coverage
-			AND moderation_decisions.recommended_action = EXCLUDED.recommended_action
-			AND moderation_decisions.authorized_action = EXCLUDED.authorized_action
-			AND moderation_decisions.authorization_reason = EXCLUDED.authorization_reason
 		RETURNING decision_id::text
 	`,
 		event.EventID,
@@ -531,7 +534,7 @@ func (s *Store) RecordTerminal(
 				until_date
 			)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULLIF($9, 0))
-			ON CONFLICT (idempotency_key) DO NOTHING
+			ON CONFLICT DO NOTHING
 		`,
 			decisionID,
 			event.EventID,
