@@ -26,7 +26,7 @@ func TestStoreRecordTerminalIsIdempotent(t *testing.T) {
 	}
 	t.Cleanup(pool.Close)
 
-	if _, err := pool.Exec(ctx, "TRUNCATE moderation_audit_log, moderation_actions, moderation_decisions, detector_signals, moderation_events"); err != nil {
+	if _, err := pool.Exec(ctx, "TRUNCATE user_reports, moderation_allowlist, community_policies, message_activity, moderation_audit_log, moderation_actions, moderation_decisions, detector_signals, moderation_events"); err != nil {
 		t.Fatalf("truncate moderation_events: %v", err)
 	}
 
@@ -221,5 +221,47 @@ func TestStoreRecordTerminalIsIdempotent(t *testing.T) {
 	}
 	if actionStatus != "SUCCEEDED" || finalEventState != string(moderation.ProcessedAction) {
 		t.Fatalf("action/event status = %q/%q", actionStatus, finalEventState)
+	}
+}
+
+func TestStoreObserveMessageCountsDuplicateAndFlood(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	if _, err := pool.Exec(ctx, "TRUNCATE message_activity CASCADE"); err != nil {
+		t.Fatal(err)
+	}
+	store, err := New(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := moderation.ActionTarget{Kind: moderation.TargetMessage, ChatID: -1001, UserID: 42, MessageID: 1}
+	content := detection.MessageContent{Text: "одинаковая реклама"}
+	ids := []string{
+		"00000000-0000-4000-8000-000000000001",
+		"00000000-0000-4000-8000-000000000002",
+		"00000000-0000-4000-8000-000000000003",
+		"00000000-0000-4000-8000-000000000004",
+		"00000000-0000-4000-8000-000000000005",
+	}
+	var stats detection.BehaviorStats
+	for index, id := range ids {
+		target.MessageID = int64(index + 1)
+		stats, err = store.ObserveMessage(ctx, events.TelegramUpdate{
+			EventID: id, TenantID: "9d83e552-8910-4c46-b55a-63074078829e",
+		}, target, content)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if stats.DuplicateCount != 5 || stats.MessagesInWindow != 5 {
+		t.Fatalf("behavior stats = %#v", stats)
 	}
 }

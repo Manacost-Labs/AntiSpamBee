@@ -114,10 +114,14 @@ func consume(
 	if err != nil {
 		return err
 	}
-	processor, err := moderation.NewProcessor(store, profiles, detection.NewProfileDetector())
-	if semantic != nil {
-		processor, err = moderation.NewProcessor(store, profiles, detection.NewProfileDetector(), semantic)
+	options := []moderation.ProcessorOption{
+		moderation.WithBehaviorStore(store),
+		moderation.WithPolicyStore(store),
 	}
+	if semantic != nil {
+		options = append(options, moderation.WithSemanticAnalyzer(semantic))
+	}
+	processor, err := moderation.NewProcessor(store, profiles, detection.NewProfileDetector(), options...)
 	if err != nil {
 		return err
 	}

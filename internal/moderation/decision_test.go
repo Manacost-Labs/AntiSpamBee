@@ -87,6 +87,18 @@ func TestDecisionEngineNeverActsOnProtectedMember(t *testing.T) {
 	}
 }
 
+func TestDecisionEngineRespectsDisabledAutomaticActions(t *testing.T) {
+	engine := NewDecisionEngine()
+	decision := engine.Decide(DecisionInput{
+		Target:                   ActionTarget{Kind: TargetMessage, ChatID: -1001, UserID: 42, MessageID: 7},
+		AutomaticActionsDisabled: true,
+		Signals:                  []detection.Signal{availableSignal("message.rules", 1, 1, 1)},
+	})
+	if decision.AuthorizedAction != ActionReview || decision.AuthorizationReason != ReasonAutomaticActionsDisabled {
+		t.Fatalf("decision = %#v", decision)
+	}
+}
+
 func availableSignal(detector string, score, confidence, coverage float64) detection.Signal {
 	return detection.Signal{
 		Detector:         detector,

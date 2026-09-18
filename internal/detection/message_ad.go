@@ -19,6 +19,7 @@ type MessageContent struct {
 	Text    string
 	Caption string
 	HasLink bool
+	URLs    []string
 }
 
 // MessageAdDetector detects prohibited commercial promotion in messages.

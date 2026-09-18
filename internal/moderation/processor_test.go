@@ -185,7 +185,7 @@ func TestProcessorRecordsJevSignalInShadowMode(t *testing.T) {
 		ReasonCodes:     []string{detection.ReasonCommercialPromotion},
 		MatchedRules:    []string{"JEV_PROHIBITED_AD_01"},
 	}}
-	processor, err := NewProcessor(store, fetcher, detection.NewProfileDetector(), semantic)
+	processor, err := NewProcessor(store, fetcher, detection.NewProfileDetector(), WithSemanticAnalyzer(semantic))
 	if err != nil {
 		t.Fatalf("NewProcessor() error = %v", err)
 	}
@@ -407,6 +407,9 @@ func TestMessageContentExtractsCaptionAndHiddenLink(t *testing.T) {
 	}
 	if !content.HasLink {
 		t.Error("hidden text link was not detected")
+	}
+	if len(content.URLs) != 1 || content.URLs[0] != "https://example.test/vpn" {
+		t.Fatalf("URLs = %v", content.URLs)
 	}
 }
 

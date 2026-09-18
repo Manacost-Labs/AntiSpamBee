@@ -246,6 +246,16 @@ func containsString(values []string, wanted string) bool {
 
 func normalize(value string) string {
 	value = strings.ToLower(strings.ReplaceAll(value, "ё", "е"))
+	value = strings.NewReplacer(
+		"@", "а",
+		"0", "о",
+		"3", "з",
+		"$", "с",
+		"\u200b", "",
+		"\u200c", "",
+		"\u200d", "",
+		"\ufeff", "",
+	).Replace(value)
 	return strings.Join(strings.FieldsFunc(value, func(r rune) bool {
 		return !unicode.IsLetter(r) && !unicode.IsNumber(r)
 	}), " ")

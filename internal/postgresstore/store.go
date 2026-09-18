@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"antispambee/internal/detection"
 	"antispambee/internal/events"
 	"antispambee/internal/moderation"
 
@@ -199,6 +200,100 @@ func New(pool *pgxpool.Pool) (*Store, error) {
 		return nil, fmt.Errorf("PostgreSQL pool is required")
 	}
 	return &Store{pool: pool}, nil
+}
+
+// ObserveMessage records one idempotent activity row and returns bounded
+// duplicate, flood, and prior-violation counts for deterministic rules.
+func (s *Store) ObserveMessage(
+	ctx context.Context,
+	event events.TelegramUpdate,
+	target moderation.ActionTarget,
+	content detection.MessageContent,
+) (detection.BehaviorStats, error) {
+	if target.Kind != moderation.TargetMessage || target.ChatID == 0 || target.UserID <= 0 || target.MessageID <= 0 {
+		return detection.BehaviorStats{}, fmt.Errorf("valid Telegram message target is required")
+	}
+	fingerprint := detection.MessageFingerprint(content)
+	if _, err := s.pool.Exec(ctx, `
+		INSERT INTO message_activity (
+			event_id, tenant_id, chat_id, user_id, message_id, content_fingerprint
+		)
+		VALUES ($1, $2, $3, $4, $5, $6)
+		ON CONFLICT (event_id) DO NOTHING
+	`, event.EventID, event.TenantID, target.ChatID, target.UserID, target.MessageID, fingerprint); err != nil {
+		return detection.BehaviorStats{}, fmt.Errorf("record message activity: %w", err)
+	}
+
+	var stats detection.BehaviorStats
+	if err := s.pool.QueryRow(ctx, `
+		SELECT
+			count(*) FILTER (
+				WHERE content_fingerprint = $4 AND observed_at >= now() - interval '10 minutes'
+			),
+			count(*) FILTER (
+				WHERE user_id = $3 AND observed_at >= now() - interval '10 seconds'
+			)
+		FROM message_activity
+		WHERE tenant_id = $1 AND chat_id = $2
+	`, event.TenantID, target.ChatID, target.UserID, fingerprint).Scan(
+		&stats.DuplicateCount,
+		&stats.MessagesInWindow,
+	); err != nil {
+		return detection.BehaviorStats{}, fmt.Errorf("query message activity: %w", err)
+	}
+	if err := s.pool.QueryRow(ctx, `
+		SELECT count(*)
+		FROM moderation_decisions AS decision
+		JOIN moderation_events AS event ON event.event_id = decision.event_id
+		JOIN message_activity AS activity ON activity.event_id = event.event_id
+		WHERE event.tenant_id = $1
+			AND activity.chat_id = $2
+			AND activity.user_id = $3
+			AND decision.risk_score >= 0.90
+			AND event.event_id <> $4
+	`, event.TenantID, target.ChatID, target.UserID, event.EventID).Scan(&stats.PreviousViolations); err != nil {
+		return detection.BehaviorStats{}, fmt.Errorf("query prior moderation violations: %w", err)
+	}
+	return stats, nil
+}
+
+// GetCommunityPolicy returns safe defaults plus the per-chat allowlist state.
+func (s *Store) GetCommunityPolicy(
+	ctx context.Context,
+	tenantID string,
+	chatID int64,
+	userID int64,
+) (moderation.CommunityPolicy, error) {
+	if tenantID == "" || chatID == 0 || userID <= 0 {
+		return moderation.CommunityPolicy{}, fmt.Errorf("valid tenant, chat, and user are required")
+	}
+	policy := moderation.CommunityPolicy{
+		ProtectionLevel:         "STANDARD",
+		AutomaticActionsEnabled: true,
+	}
+	err := s.pool.QueryRow(ctx, `
+		SELECT
+			COALESCE((
+				SELECT protection_level FROM community_policies
+				WHERE tenant_id = $1 AND chat_id = $2
+			), 'STANDARD'),
+			COALESCE((
+				SELECT automatic_actions_enabled FROM community_policies
+				WHERE tenant_id = $1 AND chat_id = $2
+			), TRUE),
+			EXISTS (
+				SELECT 1 FROM moderation_allowlist
+				WHERE tenant_id = $1 AND chat_id = $2 AND user_id = $3
+			)
+	`, tenantID, chatID, userID).Scan(
+		&policy.ProtectionLevel,
+		&policy.AutomaticActionsEnabled,
+		&policy.IsAllowlisted,
+	)
+	if err != nil {
+		return moderation.CommunityPolicy{}, fmt.Errorf("query community moderation policy: %w", err)
+	}
+	return policy, nil
 }
 
 // RecordTerminal inserts an outcome once. A retry of the same event succeeds

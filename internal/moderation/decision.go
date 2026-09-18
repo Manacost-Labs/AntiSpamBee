@@ -28,12 +28,13 @@ const (
 )
 
 const (
-	ReasonBelowActionThreshold = "BELOW_ACTION_THRESHOLD"
-	ReasonInsufficientEvidence = "INSUFFICIENT_CONFIDENCE_OR_COVERAGE"
-	ReasonNoActionableTarget   = "NO_ACTIONABLE_TARGET"
-	ReasonProtectedMember      = "PROTECTED_MEMBER"
-	ReasonCertainAdvertising   = "CERTAIN_ADVERTISING"
-	ReasonLikelyAdvertising    = "LIKELY_ADVERTISING"
+	ReasonBelowActionThreshold     = "BELOW_ACTION_THRESHOLD"
+	ReasonInsufficientEvidence     = "INSUFFICIENT_CONFIDENCE_OR_COVERAGE"
+	ReasonNoActionableTarget       = "NO_ACTIONABLE_TARGET"
+	ReasonProtectedMember          = "PROTECTED_MEMBER"
+	ReasonAutomaticActionsDisabled = "AUTOMATIC_ACTIONS_DISABLED"
+	ReasonCertainAdvertising       = "CERTAIN_ADVERTISING"
+	ReasonLikelyAdvertising        = "LIKELY_ADVERTISING"
 )
 
 // ActionTarget contains stable Telegram identifiers needed by an action worker.
@@ -57,9 +58,10 @@ type ClaimedAction struct {
 
 // DecisionInput is the complete, already-enriched input to the decision engine.
 type DecisionInput struct {
-	Target      ActionTarget
-	Signals     []detection.Signal
-	IsProtected bool
+	Target                   ActionTarget
+	Signals                  []detection.Signal
+	IsProtected              bool
+	AutomaticActionsDisabled bool
 }
 
 // Decision separates detector recommendation from policy authorization.
@@ -109,6 +111,12 @@ func (e *DecisionEngine) Decide(input DecisionInput) Decision {
 		decision.RecommendedAction = recommendedAction(decision.RiskScore, input.Target.Kind)
 		decision.AuthorizedAction = ActionReview
 		decision.AuthorizationReason = ReasonProtectedMember
+		return decision
+	}
+	if input.AutomaticActionsDisabled {
+		decision.RecommendedAction = recommendedAction(decision.RiskScore, input.Target.Kind)
+		decision.AuthorizedAction = ActionReview
+		decision.AuthorizationReason = ReasonAutomaticActionsDisabled
 		return decision
 	}
 

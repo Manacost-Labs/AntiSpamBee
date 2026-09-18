@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
+	"strings"
 
 	"antispambee/internal/detection"
 	"antispambee/internal/events"
@@ -56,14 +58,59 @@ type semanticAdAnalyzer interface {
 	AnalyzeAdvertising(context.Context, detection.SemanticAdContent) detection.Signal
 }
 
+type behaviorStore interface {
+	ObserveMessage(context.Context, events.TelegramUpdate, ActionTarget, detection.MessageContent) (detection.BehaviorStats, error)
+}
+
+type policyStore interface {
+	GetCommunityPolicy(context.Context, string, int64, int64) (CommunityPolicy, error)
+}
+
+// ProcessorOption enables optional detectors without widening the core client contracts.
+type ProcessorOption func(*Processor) error
+
+func WithSemanticAnalyzer(analyzer semanticAdAnalyzer) ProcessorOption {
+	return func(processor *Processor) error {
+		if analyzer == nil {
+			return fmt.Errorf("semantic ad analyzer must not be nil")
+		}
+		processor.semantic = analyzer
+		return nil
+	}
+}
+
+func WithBehaviorStore(store behaviorStore) ProcessorOption {
+	return func(processor *Processor) error {
+		if store == nil {
+			return fmt.Errorf("behavior store must not be nil")
+		}
+		processor.behaviorStore = store
+		processor.behavior = detection.NewBehaviorDetector()
+		return nil
+	}
+}
+
+func WithPolicyStore(store policyStore) ProcessorOption {
+	return func(processor *Processor) error {
+		if store == nil {
+			return fmt.Errorf("policy store must not be nil")
+		}
+		processor.policyStore = store
+		return nil
+	}
+}
+
 // Processor enriches events, evaluates profile risk, and records an outcome.
 type Processor struct {
-	store     terminalRecorder
-	profiles  telegramClient
-	detector  profileDetector
-	messages  *detection.MessageAdDetector
-	semantic  semanticAdAnalyzer
-	decisions *DecisionEngine
+	store         terminalRecorder
+	profiles      telegramClient
+	detector      profileDetector
+	messages      *detection.MessageAdDetector
+	semantic      semanticAdAnalyzer
+	decisions     *DecisionEngine
+	behaviorStore behaviorStore
+	behavior      *detection.BehaviorDetector
+	policyStore   policyStore
 }
 
 // NewProcessor constructs the moderation processor with automatic banning.
@@ -71,7 +118,7 @@ func NewProcessor(
 	store terminalRecorder,
 	profiles telegramClient,
 	detector profileDetector,
-	semantic ...semanticAdAnalyzer,
+	options ...ProcessorOption,
 ) (*Processor, error) {
 	if store == nil {
 		return nil, fmt.Errorf("terminal event recorder is required")
@@ -82,24 +129,22 @@ func NewProcessor(
 	if detector == nil {
 		return nil, fmt.Errorf("profile detector is required")
 	}
-	if len(semantic) > 1 {
-		return nil, fmt.Errorf("at most one semantic ad analyzer is supported")
-	}
-	var semanticAnalyzer semanticAdAnalyzer
-	if len(semantic) == 1 {
-		if semantic[0] == nil {
-			return nil, fmt.Errorf("semantic ad analyzer must not be nil")
-		}
-		semanticAnalyzer = semantic[0]
-	}
-	return &Processor{
+	processor := &Processor{
 		store:     store,
 		profiles:  profiles,
 		detector:  detector,
 		messages:  detection.NewMessageAdDetector(),
-		semantic:  semanticAnalyzer,
 		decisions: NewDecisionEngine(),
-	}, nil
+	}
+	for _, option := range options {
+		if option == nil {
+			return nil, fmt.Errorf("processor option must not be nil")
+		}
+		if err := option(processor); err != nil {
+			return nil, err
+		}
+	}
+	return processor, nil
 }
 
 // Process detects spam and atomically records a decision plus any requested
@@ -124,27 +169,49 @@ func (p *Processor) Process(ctx context.Context, event events.TelegramUpdate) er
 		}
 	}
 	signals := []detection.Signal{messageSignal, profileSignal}
+	actionTarget := target.actionTarget()
+	if p.behaviorStore != nil && actionTarget.Kind == TargetMessage &&
+		(message.Text != "" || message.Caption != "") {
+		stats, err := p.behaviorStore.ObserveMessage(ctx, event, actionTarget, message)
+		if err != nil {
+			signals = append(signals, behaviorErrorSignal())
+		} else {
+			signals = append(signals, p.behavior.Analyze(stats))
+		}
+	}
 	if p.semantic != nil {
 		signals = append(signals, p.semantic.AnalyzeAdvertising(ctx, detection.SemanticAdContent{
 			Message: message,
 			Profile: profileContext,
 		}))
 	}
-	actionTarget := target.actionTarget()
 	preliminary := p.decisions.Decide(DecisionInput{Target: actionTarget, Signals: signals})
 	isProtected := false
+	automaticActionsDisabled := false
 	if isAutomaticAction(preliminary.AuthorizedAction) {
-		status, err := p.profiles.GetChatMemberStatus(ctx, target.ChatID, target.UserID)
-		if err != nil {
-			isProtected = true
-		} else {
-			isProtected = status == "creator" || status == "administrator"
+		if p.policyStore != nil {
+			policy, err := p.policyStore.GetCommunityPolicy(ctx, event.TenantID, target.ChatID, target.UserID)
+			if err != nil {
+				isProtected = true
+			} else {
+				isProtected = policy.IsAllowlisted
+				automaticActionsDisabled = !policy.AutomaticActionsEnabled || policy.ProtectionLevel == "OBSERVE"
+			}
+		}
+		if !isProtected {
+			status, err := p.profiles.GetChatMemberStatus(ctx, target.ChatID, target.UserID)
+			if err != nil {
+				isProtected = true
+			} else {
+				isProtected = status == "creator" || status == "administrator"
+			}
 		}
 	}
 	decision := p.decisions.Decide(DecisionInput{
-		Target:      actionTarget,
-		Signals:     signals,
-		IsProtected: isProtected,
+		Target:                   actionTarget,
+		Signals:                  signals,
+		IsProtected:              isProtected,
+		AutomaticActionsDisabled: automaticActionsDisabled,
 	})
 	state := terminalStateFor(decision.AuthorizedAction)
 	var action *ActionRequest
@@ -180,6 +247,19 @@ func terminalStateFor(action ActionType) TerminalState {
 
 func isAutomaticAction(action ActionType) bool {
 	return action == ActionDeleteMessage || action == ActionDeleteReaction || action == ActionBanUser
+}
+
+func behaviorErrorSignal() detection.Signal {
+	return detection.Signal{
+		SchemaVersion:   "1",
+		Detector:        "behavior.spam",
+		DetectorVersion: "behavior-v1",
+		Category:        "spam.behavior",
+		Status:          detection.StatusError,
+		Severity:        detection.SeverityInfo,
+		ReasonCodes:     []string{detection.ReasonBehaviorStoreFailed},
+		MatchedRules:    []string{},
+	}
 }
 
 func messageContent(payload json.RawMessage) detection.MessageContent {
@@ -224,12 +304,39 @@ func messageContent(payload json.RawMessage) detection.MessageContent {
 		for _, entity := range append(candidate.Entities, candidate.CaptionEntities...) {
 			if entity.Type == "url" || entity.Type == "text_link" {
 				content.HasLink = true
-				break
+				if entity.URL != "" {
+					content.URLs = appendUniqueURL(content.URLs, entity.URL)
+				}
 			}
 		}
+		for _, extracted := range extractURLs(candidate.Text + " " + candidate.Caption) {
+			content.URLs = appendUniqueURL(content.URLs, extracted)
+		}
+		content.HasLink = content.HasLink || len(content.URLs) > 0
 		return content
 	}
 	return detection.MessageContent{}
+}
+
+var messageURLPattern = regexp.MustCompile(`(?i)(?:https?://[^\s<>"']+|(?:t|telegram)\.me/[a-z0-9_/?=&.%-]+)`)
+
+func extractURLs(value string) []string {
+	matches := messageURLPattern.FindAllString(value, -1)
+	urls := make([]string, 0, len(matches))
+	for _, match := range matches {
+		match = strings.TrimRight(match, ".,;:!?)]}")
+		urls = appendUniqueURL(urls, match)
+	}
+	return urls
+}
+
+func appendUniqueURL(values []string, value string) []string {
+	for _, existing := range values {
+		if existing == value {
+			return values
+		}
+	}
+	return append(values, value)
 }
 
 type moderationTarget struct {

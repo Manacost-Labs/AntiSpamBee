@@ -38,6 +38,17 @@ VPN с которым летает Telegram, TikTok, YouTube — БЕСПЛАТ�
 	}
 }
 
+func TestMessageAdDetectorNormalizesObfuscatedJobSpam(t *testing.T) {
+	detector := NewMessageAdDetector()
+	signal := detector.Analyze(MessageContent{
+		Text:    "Нужны сотрудники, уд@ленная работа, высокий з@р@б0ток. Пишите в личку",
+		HasLink: true,
+	})
+	if signal.Score == nil || *signal.Score < 0.9 {
+		t.Fatalf("score = %v, want at least 0.9", signal.Score)
+	}
+}
+
 func TestMessageAdDetectorFlagsVPNOfferBehindTextLink(t *testing.T) {
 	detector := newMessageAdDetector(time.Now)
 

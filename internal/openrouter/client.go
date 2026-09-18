@@ -218,6 +218,9 @@ func semanticState(content detection.SemanticAdContent) (map[string]any, float64
 	if messageText != "" {
 		state["message_text"] = messageText
 		state["message_has_link"] = content.Message.HasLink
+		if len(content.Message.URLs) > 0 {
+			state["message_urls"] = content.Message.URLs
+		}
 	}
 	if content.Profile.Username != "" {
 		state["profile_username"] = content.Profile.Username
