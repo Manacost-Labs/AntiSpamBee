@@ -195,7 +195,7 @@ func (d *ProfileDetector) Analyze(profile Profile) Signal {
 		reasons = appendUnique(reasons, ReasonAdultContent, ReasonAdvertisingChannel)
 		rules = append(rules, adultRule)
 	}
-	profileHasLink := likelyLinkPattern.MatchString(rawText)
+	profileHasLink := containsLikelyLink(rawText)
 	if profile.PersonalChannel != nil && profile.PersonalChannel.Username != "" {
 		profileHasLink = true
 	}
@@ -280,8 +280,9 @@ func normalize(value string) string {
 }
 
 func containsAny(value string, phrases ...string) bool {
+	foldedValue := foldConfusables(value)
 	for _, phrase := range phrases {
-		if strings.Contains(value, phrase) {
+		if strings.Contains(value, phrase) || strings.Contains(foldedValue, foldConfusables(phrase)) {
 			return true
 		}
 	}
@@ -289,12 +290,20 @@ func containsAny(value string, phrases ...string) bool {
 }
 
 func containsToken(value, token string) bool {
+	wanted := foldConfusables(token)
 	for _, field := range strings.Fields(value) {
-		if field == token {
+		if field == token || foldConfusables(field) == wanted {
 			return true
 		}
 	}
 	return false
+}
+
+func foldConfusables(value string) string {
+	return strings.NewReplacer(
+		"a", "а", "c", "с", "e", "е", "o", "о", "p", "р", "x", "х",
+		"y", "у", "k", "к", "m", "м", "t", "т", "b", "в", "h", "н",
+	).Replace(value)
 }
 
 func severityFor(score float64) Severity {

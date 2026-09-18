@@ -179,6 +179,16 @@ func TestProfileDetectorUsesSharedRestrictedPromotionRules(t *testing.T) {
 	}
 }
 
+func TestProfileDetectorFlagsObfuscatedChannelLink(t *testing.T) {
+	detector := newProfileDetector(time.Now)
+
+	signal := detector.Analyze(Profile{Bio: "Подпишись на наш канал t[.]me/private"})
+
+	if signal.Score == nil || *signal.Score < 0.9 {
+		t.Fatalf("score = %v, want at least 0.9", signal.Score)
+	}
+}
+
 func TestProfileDetectorDoesNotFlagNeutralSensitiveTopicsInBio(t *testing.T) {
 	detector := newProfileDetector(time.Now)
 

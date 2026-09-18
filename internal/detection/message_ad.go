@@ -9,6 +9,7 @@ import (
 var jobMoneyAmountPattern = regexp.MustCompile(`(?i)(?:[1-9][0-9]{2,6}|[1-9][0-9]{0,2}[ .][0-9]{3})\s*(?:₽|руб(?:лей|ля|ль)?\.?)`)
 var percentageReturnPattern = regexp.MustCompile(`(?i)\b\d{1,3}\s*%\s*(?:в|за)\s*(?:день|недел|месяц)`)
 var likelyLinkPattern = regexp.MustCompile(`(?i)(?:https?://|(?:t|telegram)\.me/|(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:ru|com|net|org|io|me|ai|app|site|online|xyz|рф)(?:/|\b))`)
+var obfuscatedLinkPattern = regexp.MustCompile(`(?i)(?:(?:t|telegram)\s*(?:\[\s*\.\s*\]|\(\s*\.\s*\)|\s+(?:dot|точка)\s+)\s*me(?:/|\b)|\b[a-z0-9][a-z0-9-]*\s*\[\s*\.\s*\]\s*(?:ru|com|net|org|io|me|ai|app|site|online|xyz)(?:/|\b))`)
 
 const (
 	ReasonCommercialPromotion = "COMMERCIAL_PROMOTION"
@@ -23,6 +24,7 @@ const (
 type MessageContent struct {
 	Text    string
 	Caption string
+	OCRText string
 	HasLink bool
 	URLs    []string
 }
@@ -53,7 +55,7 @@ func (d *MessageAdDetector) Analyze(content MessageContent) Signal {
 		CreatedAt:       d.now().UTC(),
 	}
 
-	combined := strings.TrimSpace(strings.Join([]string{content.Text, content.Caption}, " "))
+	combined := strings.TrimSpace(strings.Join([]string{content.Text, content.Caption, content.OCRText}, " "))
 	if combined == "" {
 		base.Status = StatusMissing
 		base.Severity = SeverityInfo
@@ -61,8 +63,9 @@ func (d *MessageAdDetector) Analyze(content MessageContent) Signal {
 		return base
 	}
 
-	score, reasons, rules := detectCommercialPromotion(combined, content.HasLink, "MESSAGE_AD_")
-	restrictedScore, restrictedReasons, restrictedRules := detectRestrictedPromotion(combined, content.HasLink, "MESSAGE_AD_")
+	hasLink := content.HasLink || containsLikelyLink(combined)
+	score, reasons, rules := detectCommercialPromotion(combined, hasLink, "MESSAGE_AD_")
+	restrictedScore, restrictedReasons, restrictedRules := detectRestrictedPromotion(combined, hasLink, "MESSAGE_AD_")
 	if restrictedScore > score {
 		score = restrictedScore
 	}
@@ -88,7 +91,7 @@ func detectRestrictedPromotion(combined string, hasLink bool, rulePrefix string)
 	employmentHook := containsAny(text,
 		"частичная занятость", "частичную занятость", "удаленная работа", "удаленную работу", "работа из дома",
 		"свободный график", "подработка",
-	)
+	) || containsSegmentedKeyword(text, "подработка")
 	moneyHook := containsAny(text,
 		"высокий доход", "стабильный доход", "заработок", "без вложений", "в день",
 	)
@@ -99,7 +102,7 @@ func detectRestrictedPromotion(combined string, hasLink bool, rulePrefix string)
 	directJobPitch := massRecruitment || containsAny(text,
 		"ищем подработку", "предлагаем подработку", "есть подработка", "подработка для",
 		"подработка от", "требуется на подработку", "требуются на подработку", "набор на подработку",
-	)
+	) || containsSegmentedKeyword(text, "подработка")
 	directMessageCTA := jobCTA || containsAny(text,
 		"в лс", "в личку", "в личные сообщения", "в директ", "в личные", "писать", "связь через",
 	)
@@ -149,6 +152,30 @@ func detectRestrictedPromotion(combined string, hasLink bool, rulePrefix string)
 		rules = append(rules, rulePrefix+"ADULT_01")
 	}
 	return score, reasons, rules
+}
+
+func containsLikelyLink(value string) bool {
+	return likelyLinkPattern.MatchString(value) || obfuscatedLinkPattern.MatchString(value)
+}
+
+func containsSegmentedKeyword(value, keyword string) bool {
+	fields := strings.Fields(value)
+	wanted := foldConfusables(strings.ReplaceAll(normalize(keyword), " ", ""))
+	wantedLength := len([]rune(wanted))
+	for start := range fields {
+		joined := ""
+		for end := start; end < len(fields); end++ {
+			joined += fields[end]
+			length := len([]rune(joined))
+			if length > wantedLength {
+				break
+			}
+			if end > start && foldConfusables(joined) == wanted {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func detectCommercialPromotion(combined string, hasLink bool, rulePrefix string) (float64, []string, []string) {

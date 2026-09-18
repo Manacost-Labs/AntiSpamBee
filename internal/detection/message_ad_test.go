@@ -211,6 +211,36 @@ func TestMessageAdDetectorGoldenSpamVariants(t *testing.T) {
 	}
 }
 
+func TestMessageAdDetectorFlagsSegmentedKeywordsAndObfuscatedLinks(t *testing.T) {
+	detector := newMessageAdDetector(time.Now)
+	cases := []MessageContent{
+		{Text: "П.О.Д.Р.А.Б.О.Т.К.А 5000 ₽, пиши в ЛС"},
+		{Text: "ПOДРAБOТКA 5000 ₽, пиши в ЛС"},
+		{Text: "V P N без блокировок — подключайся: t[.]me/free_vpn"},
+		{Text: "Подпишись на наш канал t[.]me/best_channel"},
+	}
+
+	for _, content := range cases {
+		signal := detector.Analyze(content)
+		if signal.Score == nil || *signal.Score < 0.9 {
+			t.Errorf("text %q: score = %v, want at least 0.9", content.Text, signal.Score)
+		}
+	}
+}
+
+func TestMessageAdDetectorDoesNotTreatOrdinaryInitialsAsObfuscatedAdvertising(t *testing.T) {
+	detector := newMessageAdDetector(time.Now)
+	for _, text := range []string{
+		"В. П. Н. Петров подготовил доклад",
+		"Под работу выделили отдельный сервер",
+	} {
+		signal := detector.Analyze(MessageContent{Text: text})
+		if signal.Score == nil || *signal.Score != 0 {
+			t.Errorf("text %q: score = %v, want 0", text, signal.Score)
+		}
+	}
+}
+
 func TestMessageAdDetectorGoldenHamVariants(t *testing.T) {
 	detector := newMessageAdDetector(time.Now)
 	for _, text := range []string{
