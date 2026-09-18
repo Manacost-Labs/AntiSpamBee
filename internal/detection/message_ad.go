@@ -91,7 +91,7 @@ func detectRestrictedPromotion(combined string, hasLink bool, rulePrefix string)
 	employmentHook := containsAny(text,
 		"частичная занятость", "частичную занятость", "удаленная работа", "удаленную работу", "работа из дома",
 		"свободный график", "подработка",
-	) || containsSegmentedKeyword(text, "подработка")
+	) || containsSegmentedJobKeyword(text)
 	moneyHook := containsAny(text,
 		"высокий доход", "стабильный доход", "заработок", "без вложений", "в день",
 	)
@@ -102,7 +102,7 @@ func detectRestrictedPromotion(combined string, hasLink bool, rulePrefix string)
 	directJobPitch := massRecruitment || containsAny(text,
 		"ищем подработку", "предлагаем подработку", "есть подработка", "подработка для",
 		"подработка от", "требуется на подработку", "требуются на подработку", "набор на подработку",
-	) || containsSegmentedKeyword(text, "подработка")
+	) || containsSegmentedJobKeyword(text)
 	directMessageCTA := jobCTA || containsAny(text,
 		"в лс", "в личку", "в личные сообщения", "в директ", "в личные", "писать", "связь через",
 	)
@@ -173,6 +173,15 @@ func containsSegmentedKeyword(value, keyword string) bool {
 			if end > start && foldConfusables(joined) == wanted {
 				return true
 			}
+		}
+	}
+	return false
+}
+
+func containsSegmentedJobKeyword(value string) bool {
+	for _, keyword := range []string{"подработка", "подработку", "подработки", "подработке", "подработкой"} {
+		if containsSegmentedKeyword(value, keyword) {
+			return true
 		}
 	}
 	return false

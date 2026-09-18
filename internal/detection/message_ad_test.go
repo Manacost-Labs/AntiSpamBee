@@ -215,6 +215,7 @@ func TestMessageAdDetectorFlagsSegmentedKeywordsAndObfuscatedLinks(t *testing.T)
 	detector := newMessageAdDetector(time.Now)
 	cases := []MessageContent{
 		{Text: "П.О.Д.Р.А.Б.О.Т.К.А 5000 ₽, пиши в ЛС"},
+		{Text: "ИЩЕМ П.О.Д.Р.А.Б.О.Т.К.У 5000 РУБЛЕЙ В ЛС"},
 		{Text: "ПOДРAБOТКA 5000 ₽, пиши в ЛС"},
 		{Text: "V P N без блокировок — подключайся: t[.]me/free_vpn"},
 		{Text: "Подпишись на наш канал t[.]me/best_channel"},
