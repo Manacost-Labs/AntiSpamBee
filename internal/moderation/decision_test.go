@@ -45,16 +45,30 @@ func TestDecisionEngineDeletesReactionAtNinetyPercent(t *testing.T) {
 	}
 }
 
-func TestDecisionEngineKeepsModelSignalsInShadow(t *testing.T) {
+func TestDecisionEngineUsesHighConfidenceModelForDeleteOnly(t *testing.T) {
 	engine := NewDecisionEngine()
 
 	decision := engine.Decide(DecisionInput{
 		Target:  ActionTarget{Kind: TargetMessage, ChatID: -1001, UserID: 42, MessageID: 7},
-		Signals: []detection.Signal{availableSignal("model.jev_advertising", 1, 1, 1)},
+		Signals: []detection.Signal{availableSignal("model.jev_advertising", 1, 0.98, 1)},
 	})
 
-	if decision.AuthorizedAction != ActionAllow {
-		t.Fatalf("authorized action = %q, want ALLOW for shadow-only evidence", decision.AuthorizedAction)
+	if decision.AuthorizedAction != ActionDeleteMessage || decision.RiskScore >= 1 {
+		t.Fatalf("decision = %#v, want delete-only model enforcement", decision)
+	}
+}
+
+func TestDecisionEngineBansWhenIndependentSignalsCorroborate(t *testing.T) {
+	engine := NewDecisionEngine()
+	decision := engine.Decide(DecisionInput{
+		Target: ActionTarget{Kind: TargetMessage, ChatID: -1001, UserID: 42, MessageID: 7},
+		Signals: []detection.Signal{
+			availableSignal("message.rules", 0.95, 0.95, 1),
+			availableSignal("model.jev_advertising", 0.96, 0.96, 1),
+		},
+	})
+	if decision.AuthorizedAction != ActionBanUser || decision.RiskScore != 1 {
+		t.Fatalf("decision = %#v, want corroborated BAN_USER", decision)
 	}
 }
 

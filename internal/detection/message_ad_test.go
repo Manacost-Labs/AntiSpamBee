@@ -189,6 +189,44 @@ func TestMessageAdDetectorDoesNotFlagIncompleteCompactJobPromotion(t *testing.T)
 	}
 }
 
+func TestMessageAdDetectorGoldenSpamVariants(t *testing.T) {
+	detector := newMessageAdDetector(time.Now)
+	cases := []MessageContent{
+		{Text: "Работа 2 часа в день, выплата 10к, писать @manager"},
+		{Text: "Требуется менеджер, доход 5000 в день, пиши в ЛС"},
+		{Text: "Подпишись на наш канал t.me/best_channel", HasLink: true},
+		{Text: "Лучшие цены на кроссовки, каталог shop.ru", HasLink: true},
+		{Text: "Разыгрываем iPhone, забери приз по ссылке", HasLink: true},
+		{Text: "VРN без блокировок, подключайся vpn.ru", HasLink: true},
+		{Text: "Ставки заходят каждый день, прогнозы в нашем канале", HasLink: true},
+		{Text: "Крипта даёт 20% в месяц, сигналы в ЛС", HasLink: true},
+		{Text: "Деньги срочно без отказов, заявка на сайте", HasLink: true},
+		{Text: "18+ девочки, приват в нашем канале", HasLink: true},
+	}
+	for _, content := range cases {
+		signal := detector.Analyze(content)
+		if signal.Score == nil || *signal.Score < 0.9 {
+			t.Errorf("text %q: score = %v, want at least 0.9", content.Text, signal.Score)
+		}
+	}
+}
+
+func TestMessageAdDetectorGoldenHamVariants(t *testing.T) {
+	detector := newMessageAdDetector(time.Now)
+	for _, text := range []string{
+		"Ищу работу менеджером, ожидаю зарплату 5000 рублей",
+		"Обсуждаем ставки Центрального банка",
+		"Сегодня полностью закрыл кредит без просрочек",
+		"Приватный репозиторий проекта находится на GitHub",
+		"Розыгрыш мяча привёл к победному голу",
+	} {
+		signal := detector.Analyze(MessageContent{Text: text})
+		if signal.Score == nil || *signal.Score != 0 {
+			t.Errorf("text %q: score = %v, want 0", text, signal.Score)
+		}
+	}
+}
+
 func TestMessageAdDetectorDoesNotFlagNeutralSensitiveTopics(t *testing.T) {
 	detector := newMessageAdDetector(time.Now)
 

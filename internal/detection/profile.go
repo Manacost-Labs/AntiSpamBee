@@ -195,7 +195,10 @@ func (d *ProfileDetector) Analyze(profile Profile) Signal {
 		reasons = appendUnique(reasons, ReasonAdultContent, ReasonAdvertisingChannel)
 		rules = append(rules, adultRule)
 	}
-	profileHasLink := containsAny(rawText, "http://", "https://", "t.me/", "telegram.me/")
+	profileHasLink := likelyLinkPattern.MatchString(rawText)
+	if profile.PersonalChannel != nil && profile.PersonalChannel.Username != "" {
+		profileHasLink = true
+	}
 	commercialScore, commercialReasons, commercialRules := detectCommercialPromotion(
 		combinedText,
 		profileHasLink,
@@ -210,6 +213,21 @@ func (d *ProfileDetector) Analyze(profile Profile) Signal {
 			reasons = appendUnique(reasons, ReasonAdvertisingChannel)
 		}
 		rules = append(rules, commercialRules...)
+	}
+	restrictedScore, restrictedReasons, restrictedRules := detectRestrictedPromotion(
+		combinedText,
+		profileHasLink,
+		"PROFILE_AD_",
+	)
+	if restrictedScore > 0 {
+		if restrictedScore > score {
+			score = restrictedScore
+		}
+		reasons = appendUnique(reasons, restrictedReasons...)
+		if profile.PersonalChannel != nil {
+			reasons = appendUnique(reasons, ReasonAdvertisingChannel)
+		}
+		rules = append(rules, restrictedRules...)
 	}
 	if score > 1 {
 		score = 1
@@ -305,5 +323,9 @@ func profileCoverage(profile Profile) float64 {
 			available++
 		}
 	}
-	return float64(available) / 4
+	coverage := float64(available) / 4
+	if available > 0 && coverage < 0.5 {
+		return 0.5
+	}
+	return coverage
 }

@@ -91,16 +91,40 @@ func (e *DecisionEngine) Decide(input DecisionInput) Decision {
 		AuthorizedAction:    ActionAllow,
 		AuthorizationReason: ReasonBelowActionThreshold,
 	}
+	highSignalCount := 0
+	hasDeterministicHighSignal := false
+	corroboratedConfidence := 1.0
+	corroboratedCoverage := 1.0
 	for _, signal := range input.Signals {
 		if signal.Status != detection.StatusAvailable || signal.Score == nil ||
-			signal.Confidence == nil || strings.HasPrefix(signal.Detector, "model.") {
+			signal.Confidence == nil {
 			continue
 		}
-		if *signal.Score > decision.RiskScore {
-			decision.RiskScore = *signal.Score
+		isModel := strings.HasPrefix(signal.Detector, "model.")
+		candidateScore := *signal.Score
+		if isModel && candidateScore > 0.97 {
+			candidateScore = 0.97
+		}
+		if candidateScore > decision.RiskScore {
+			decision.RiskScore = candidateScore
 			decision.DecisionConfidence = *signal.Confidence
 			decision.EvidenceCoverage = signal.EvidenceCoverage
 		}
+		if *signal.Score >= 0.90 && *signal.Confidence >= 0.90 && signal.EvidenceCoverage >= 0.50 {
+			highSignalCount++
+			hasDeterministicHighSignal = hasDeterministicHighSignal || !isModel
+			if *signal.Confidence < corroboratedConfidence {
+				corroboratedConfidence = *signal.Confidence
+			}
+			if signal.EvidenceCoverage < corroboratedCoverage {
+				corroboratedCoverage = signal.EvidenceCoverage
+			}
+		}
+	}
+	if highSignalCount >= 2 && hasDeterministicHighSignal {
+		decision.RiskScore = 1
+		decision.DecisionConfidence = corroboratedConfidence
+		decision.EvidenceCoverage = corroboratedCoverage
 	}
 
 	if decision.RiskScore < 0.90 {

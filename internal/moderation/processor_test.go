@@ -193,22 +193,23 @@ func TestProcessorRecordsReviewForVPNAdvertisementInMessage(t *testing.T) {
 	}
 }
 
-func TestProcessorRecordsJevSignalInShadowMode(t *testing.T) {
+func TestProcessorUsesHighConfidenceJevSignalForDeletion(t *testing.T) {
 	store := &recordingStore{}
 	fetcher := &profileFetcherStub{profile: detection.Profile{Bio: "Личный блог"}}
 	score := 0.97
 	confidence := 0.91
 	semantic := &semanticAdStub{signal: detection.Signal{
-		SchemaVersion:   "1",
-		Detector:        "model.jev_advertising",
-		DetectorVersion: "jev-openrouter-v1",
-		Category:        "spam.advertising",
-		Status:          detection.StatusAvailable,
-		Score:           &score,
-		Confidence:      &confidence,
-		Severity:        detection.SeverityHigh,
-		ReasonCodes:     []string{detection.ReasonCommercialPromotion},
-		MatchedRules:    []string{"JEV_PROHIBITED_AD_01"},
+		SchemaVersion:    "1",
+		Detector:         "model.jev_advertising",
+		DetectorVersion:  "jev-openrouter-v1",
+		Category:         "spam.advertising",
+		Status:           detection.StatusAvailable,
+		Score:            &score,
+		Confidence:       &confidence,
+		EvidenceCoverage: 1,
+		Severity:         detection.SeverityHigh,
+		ReasonCodes:      []string{detection.ReasonCommercialPromotion},
+		MatchedRules:     []string{"JEV_PROHIBITED_AD_01"},
 	}}
 	processor, err := NewProcessor(store, fetcher, detection.NewProfileDetector(), WithSemanticAnalyzer(semantic))
 	if err != nil {
@@ -216,6 +217,7 @@ func TestProcessorRecordsJevSignalInShadowMode(t *testing.T) {
 	}
 	event := telegramEvent(`{
 		"message": {
+			"message_id": 90,
 			"from": {"id": 42},
 			"chat": {"id": -100777, "type": "supergroup"},
 			"text": "Посмотрите мой новый проект"
@@ -226,8 +228,8 @@ func TestProcessorRecordsJevSignalInShadowMode(t *testing.T) {
 		t.Fatalf("Process() error = %v", err)
 	}
 
-	if store.outcome.State != ProcessedAllow {
-		t.Fatalf("terminal state = %q, want shadow ALLOW", store.outcome.State)
+	if store.outcome.State != DecidedPendingAction || !hasAction(store.outcome, ActionDeleteMessage) {
+		t.Fatalf("outcome = %#v, want pending DELETE_MESSAGE", store.outcome)
 	}
 	jevSignal := signalByDetector(t, store.outcome, "model.jev_advertising")
 	if jevSignal.Score == nil || *jevSignal.Score != 0.97 {
@@ -362,6 +364,58 @@ func TestProcessorQueuesExclusiveVPNPromotionDeletionWithBareDomain(t *testing.T
 	}
 	if !hasAction(store.outcome, ActionDeleteMessage) {
 		t.Fatalf("actions = %#v, want DELETE_MESSAGE", store.outcome.Actions)
+	}
+}
+
+func TestProcessorDeletesAdvertisingMessageSentAsChannel(t *testing.T) {
+	store := &recordingStore{}
+	fetcher := &profileFetcherStub{}
+	processor, err := NewProcessor(store, fetcher, detection.NewProfileDetector())
+	if err != nil {
+		t.Fatalf("NewProcessor() error = %v", err)
+	}
+	event := telegramEvent(`{
+		"message": {
+			"message_id": 94,
+			"sender_chat": {"id": -100999, "type": "channel"},
+			"chat": {"id": -100777, "type": "supergroup"},
+			"text": "VPN с которым летают все соц сети только у нас vpn.ru"
+		}
+	}`)
+
+	if err := processor.Process(context.Background(), event); err != nil {
+		t.Fatalf("Process() error = %v", err)
+	}
+
+	if !hasAction(store.outcome, ActionDeleteMessage) {
+		t.Fatalf("actions = %#v, want DELETE_MESSAGE", store.outcome.Actions)
+	}
+	if fetcher.calls != 0 {
+		t.Fatalf("profile fetch calls = %d, want 0 for sender_chat", fetcher.calls)
+	}
+}
+
+func TestProcessorRetriesWhenHighRiskMemberStatusIsUnavailable(t *testing.T) {
+	store := &recordingStore{}
+	fetcher := &profileFetcherStub{memberErr: errors.New("telegram unavailable")}
+	processor, err := NewProcessor(store, fetcher, detection.NewProfileDetector())
+	if err != nil {
+		t.Fatal(err)
+	}
+	event := telegramEvent(`{
+		"message": {
+			"message_id": 95,
+			"from": {"id": 42},
+			"chat": {"id": -100777, "type": "supergroup"},
+			"text": "VPN с которым летают все соц сети только у нас vpn.ru"
+		}
+	}`)
+
+	if err := processor.Process(context.Background(), event); err == nil {
+		t.Fatal("Process() succeeded, want retryable member-status error")
+	}
+	if store.event.EventID != "" {
+		t.Fatal("terminal review must not be recorded before member status is known")
 	}
 }
 

@@ -194,20 +194,18 @@ func (p *Processor) Process(ctx context.Context, event events.TelegramUpdate) er
 		if p.policyStore != nil {
 			policy, err := p.policyStore.GetCommunityPolicy(ctx, event.TenantID, target.ChatID, target.UserID)
 			if err != nil {
-				isProtected = true
-			} else {
-				isProtected = policy.IsAllowlisted
-				automaticActionsDisabled = !policy.AutomaticActionsEnabled || policy.ProtectionLevel == "OBSERVE"
-				autobanDisabled = !policy.AutobanEnabled
+				return fmt.Errorf("load community moderation policy: %w", err)
 			}
+			isProtected = policy.IsAllowlisted
+			automaticActionsDisabled = !policy.AutomaticActionsEnabled || policy.ProtectionLevel == "OBSERVE"
+			autobanDisabled = !policy.AutobanEnabled
 		}
-		if !isProtected {
+		if !isProtected && target.UserID > 0 {
 			status, err := p.profiles.GetChatMemberStatus(ctx, target.ChatID, target.UserID)
 			if err != nil {
-				isProtected = true
-			} else {
-				isProtected = status == "creator" || status == "administrator"
+				return fmt.Errorf("get Telegram member status before automatic action: %w", err)
 			}
+			isProtected = status == "creator" || status == "administrator"
 		}
 	}
 	decision := p.decisions.Decide(DecisionInput{
@@ -368,7 +366,10 @@ type moderationTarget struct {
 }
 
 func (t moderationTarget) actionTarget() ActionTarget {
-	if t.ChatID == 0 || t.UserID <= 0 || t.MessageID <= 0 {
+	if t.ChatID == 0 || t.MessageID <= 0 {
+		return ActionTarget{}
+	}
+	if t.Kind == TargetReaction && t.UserID <= 0 {
 		return ActionTarget{}
 	}
 	if t.ChatType != "group" && t.ChatType != "supergroup" && t.ChatType != "channel" {
@@ -410,7 +411,10 @@ func moderationTargetFrom(payload json.RawMessage) moderationTarget {
 		return moderationTarget{}
 	}
 	targetFrom := func(chatValue *chat, senderValue *sender, messageID int64, kind TargetKind) moderationTarget {
-		target := moderationTarget{UserID: senderValue.ID, MessageID: messageID, Kind: kind}
+		target := moderationTarget{MessageID: messageID, Kind: kind}
+		if senderValue != nil {
+			target.UserID = senderValue.ID
+		}
 		if chatValue != nil {
 			target.ChatID = chatValue.ID
 			target.ChatType = chatValue.Type
@@ -423,7 +427,7 @@ func moderationTargetFrom(payload json.RawMessage) moderationTarget {
 		update.BusinessMessage,
 		update.EditedBusinessMessage,
 	} {
-		if candidate != nil && candidate.From != nil && candidate.From.ID > 0 {
+		if candidate != nil {
 			return targetFrom(candidate.Chat, candidate.From, candidate.MessageID, TargetMessage)
 		}
 	}

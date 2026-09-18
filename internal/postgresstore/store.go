@@ -234,7 +234,9 @@ func (s *Store) ObserveMessage(
 	if err := s.pool.QueryRow(ctx, `
 		SELECT
 			count(*) FILTER (
-				WHERE content_fingerprint = $4 AND observed_at >= now() - interval '10 minutes'
+				WHERE user_id = $3
+					AND content_fingerprint = $4
+					AND observed_at >= now() - interval '10 minutes'
 			),
 			count(*) FILTER (
 				WHERE user_id = $3 AND observed_at >= now() - interval '10 seconds'

@@ -7,6 +7,8 @@ import (
 )
 
 var jobMoneyAmountPattern = regexp.MustCompile(`(?i)(?:[1-9][0-9]{2,6}|[1-9][0-9]{0,2}[ .][0-9]{3})\s*(?:₽|руб(?:лей|ля|ль)?\.?)`)
+var percentageReturnPattern = regexp.MustCompile(`(?i)\b\d{1,3}\s*%\s*(?:в|за)\s*(?:день|недел|месяц)`)
+var likelyLinkPattern = regexp.MustCompile(`(?i)(?:https?://|(?:t|telegram)\.me/|(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:ru|com|net|org|io|me|ai|app|site|online|xyz|рф)(?:/|\b))`)
 
 const (
 	ReasonCommercialPromotion = "COMMERCIAL_PROMOTION"
@@ -60,7 +62,7 @@ func (d *MessageAdDetector) Analyze(content MessageContent) Signal {
 	}
 
 	score, reasons, rules := detectCommercialPromotion(combined, content.HasLink, "MESSAGE_AD_")
-	restrictedScore, restrictedReasons, restrictedRules := detectRestrictedMessagePromotion(combined, content.HasLink)
+	restrictedScore, restrictedReasons, restrictedRules := detectRestrictedPromotion(combined, content.HasLink, "MESSAGE_AD_")
 	if restrictedScore > score {
 		score = restrictedScore
 	}
@@ -77,7 +79,7 @@ func (d *MessageAdDetector) Analyze(content MessageContent) Signal {
 	return base
 }
 
-func detectRestrictedMessagePromotion(combined string, hasLink bool) (float64, []string, []string) {
+func detectRestrictedPromotion(combined string, hasLink bool, rulePrefix string) (float64, []string, []string) {
 	text := normalize(combined)
 	massRecruitment := containsAny(text,
 		"нужны сотрудники", "требуются сотрудники", "ищу сотрудников", "ищем сотрудников",
@@ -99,9 +101,16 @@ func detectRestrictedMessagePromotion(combined string, hasLink bool) (float64, [
 		"подработка от", "требуется на подработку", "требуются на подработку", "набор на подработку",
 	)
 	directMessageCTA := jobCTA || containsAny(text,
-		"в лс", "в личку", "в личные сообщения", "в директ", "в личные",
+		"в лс", "в личку", "в личные сообщения", "в директ", "в личные", "писать", "связь через",
 	)
 	compactJobPromotion := directJobPitch && jobMoneyAmountPattern.MatchString(combined) && directMessageCTA
+	jobContext := employmentHook || containsAny(text,
+		"требуется менеджер", "требуются менеджеры", "работа 2 часа", "работа на дому", "вакансия",
+	)
+	jobPayment := jobMoneyAmountPattern.MatchString(combined) || containsAny(text,
+		"выплата", "оплата", "доход", "зарплата", "10к", "20к", "30к",
+	)
+	compactJobPromotion = compactJobPromotion || (jobContext && jobPayment && directMessageCTA)
 
 	adultMention := containsAny(text,
 		"onlyfans", "онлифанс", "нюдсы", "интимные фото", "интимные видео", "секс чат",
@@ -112,6 +121,10 @@ func detectRestrictedMessagePromotion(combined string, hasLink bool) (float64, [
 		"смотреть видео", "приватный контент", "private content",
 	)
 	adultPromotion := adultMention && (adultCTA || hasLink)
+	ageMarker := strings.Contains(strings.ToLower(combined), "18+") || strings.Contains(combined, "🔞")
+	adultEuphemism := ageMarker && containsAny(text,
+		"девочки", "девушки", "приват", "private", "контент для взрослых",
+	) && (hasLink || containsAny(text, "канал", "группа", "подпис"))
 
 	score := 0.0
 	reasons := []string{}
@@ -119,28 +132,29 @@ func detectRestrictedMessagePromotion(combined string, hasLink bool) (float64, [
 	if jobPromotion {
 		score = 0.93
 		reasons = appendUnique(reasons, ReasonCommercialPromotion, ReasonMassJobOffer)
-		rules = append(rules, "MESSAGE_AD_JOB_01")
+		rules = append(rules, rulePrefix+"JOB_01")
 	}
 	if compactJobPromotion {
 		if score < 0.97 {
 			score = 0.97
 		}
 		reasons = appendUnique(reasons, ReasonCommercialPromotion, ReasonMassJobOffer)
-		rules = append(rules, "MESSAGE_AD_JOB_COMPACT_01")
+		rules = append(rules, rulePrefix+"JOB_COMPACT_01")
 	}
-	if adultPromotion {
+	if adultPromotion || adultEuphemism {
 		if score < 0.95 {
 			score = 0.95
 		}
 		reasons = appendUnique(reasons, ReasonCommercialPromotion, ReasonAdultContent)
-		rules = append(rules, "MESSAGE_AD_ADULT_01")
+		rules = append(rules, rulePrefix+"ADULT_01")
 	}
 	return score, reasons, rules
 }
 
 func detectCommercialPromotion(combined string, hasLink bool, rulePrefix string) (float64, []string, []string) {
 	text := normalize(combined)
-	vpnMention := containsToken(text, "vpn") ||
+	vpnFolded := strings.NewReplacer("р", "p", "ν", "v").Replace(text)
+	vpnMention := containsToken(text, "vpn") || strings.Contains(vpnFolded, "vpn") ||
 		containsToken(text, "впн") ||
 		containsAny(text, "nordvpn", "expressvpn", "protonvpn", "surfshark")
 	freeHook := containsAny(text, "бесплатн", "free vpn", "free access")
@@ -164,6 +178,9 @@ func detectCommercialPromotion(combined string, hasLink bool, rulePrefix string)
 		"летает telegram",
 		"обход блокировок",
 		"забудь про блокировки",
+		"без блокировок",
+		"без ограничений",
+		"подключайся",
 	)
 	promotionClaim := containsAny(text,
 		"летают все соц сети",
@@ -200,6 +217,16 @@ func detectCommercialPromotion(combined string, hasLink bool, rulePrefix string)
 		"регистрируйся",
 	)
 	genericPromotion := hasLink && offerHook && commercialCallToAction
+	channelPromotion := hasLink && containsAny(text, "канал", "группа", "сообщество") && containsAny(text,
+		"подпишись", "подписывайся", "подписаться", "наш канал", "в нашем канале",
+	)
+	shopPromotion := hasLink && containsAny(text, "лучшие цены", "низкие цены", "каталог", "в наличии") && containsAny(text,
+		"цены", "каталог", "заказ", "доставка", "магазин",
+	)
+	giveawayPromotion := hasLink && containsAny(text, "розыгрыш", "разыгрываем", "выиграй") && containsAny(text,
+		"приз", "подарок", "iphone", "айфон", "забери", "получи",
+	)
+	genericPromotion = genericPromotion || channelPromotion || shopPromotion || giveawayPromotion
 
 	gamblingMention := containsAny(text,
 		"казино", "casino", "ставки", "ставок", "букмекер", "беттинг", "слоты",
@@ -211,6 +238,9 @@ func detectCommercialPromotion(combined string, hasLink bool, rulePrefix string)
 		"забрать", "получить бонус", "играй", "начни играть", "делай ставку", "регистрируйся",
 	)
 	gamblingPromotion := gamblingMention && gamblingHook && (gamblingCTA || hasLink)
+	gamblingPromotion = gamblingPromotion || (gamblingMention && hasLink && containsAny(text,
+		"прогноз", "заходят", "коэффициент", "экспресс", "в нашем канале",
+	))
 
 	cryptoMention := containsAny(text,
 		"крипт", "crypto", "bitcoin", "биткоин", "инвестиц", "трейдинг", "trading",
@@ -223,15 +253,16 @@ func detectCommercialPromotion(combined string, hasLink bool, rulePrefix string)
 		"вступай", "присоединяйся", "инвестируй", "начни зарабатывать", "пиши в личку", "пиши в лс",
 	)
 	cryptoPromotion := cryptoMention && cryptoPromise && (cryptoCTA || hasLink)
+	cryptoPromotion = cryptoPromotion || (cryptoMention && (percentageReturnPattern.MatchString(combined) || containsAny(text, "сигналы в лс", "сигналы в лич")) && hasLink)
 
 	loanMention := containsAny(text,
-		"займ", "микрозайм", "кредит", "деньги до зарплаты",
+		"займ", "микрозайм", "кредит", "деньги до зарплаты", "деньги срочно",
 	)
 	loanHook := containsAny(text,
-		"без отказа", "без проверки", "без справок", "за 5 минут", "за пять минут", "одобрение всем",
+		"без отказа", "без отказов", "без проверки", "без справок", "за 5 минут", "за пять минут", "одобрение всем",
 	)
 	loanCTA := containsAny(text,
-		"оформить", "получить деньги", "подать заявку", "оставить заявку", "бери сейчас",
+		"оформить", "получить деньги", "подать заявку", "оставить заявку", "заявка на сайте", "бери сейчас",
 	)
 	loanPromotion := loanMention && loanHook && (loanCTA || hasLink)
 

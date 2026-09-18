@@ -161,6 +161,24 @@ func TestProfileDetectorFlagsProhibitedAdsInBio(t *testing.T) {
 	}
 }
 
+func TestProfileDetectorUsesSharedRestrictedPromotionRules(t *testing.T) {
+	detector := newProfileDetector(time.Now)
+	profiles := []Profile{
+		{Bio: "Ищем подработку 5000 рублей в ЛС"},
+		{Bio: "VPN с которым летают все соц сети только у нас vpn.ru"},
+		{Bio: "🔞 Девочки, приват в канале t.me/private"},
+	}
+	for _, profile := range profiles {
+		signal := detector.Analyze(profile)
+		if signal.Score == nil || *signal.Score < 0.9 {
+			t.Errorf("profile %#v: score = %v, want at least 0.9", profile, signal.Score)
+		}
+		if signal.EvidenceCoverage < 0.5 {
+			t.Errorf("profile %#v: coverage = %.2f, want at least 0.5", profile, signal.EvidenceCoverage)
+		}
+	}
+}
+
 func TestProfileDetectorDoesNotFlagNeutralSensitiveTopicsInBio(t *testing.T) {
 	detector := newProfileDetector(time.Now)
 
