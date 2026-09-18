@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"path"
 	"strings"
 	"time"
 
@@ -138,6 +139,63 @@ func (c *Client) FetchProfile(ctx context.Context, userID int64) (detection.Prof
 		RecentPosts: posts,
 	}
 	return profile, nil
+}
+
+// DownloadFile resolves a Telegram file_id and downloads at most maxBytes.
+// Telegram documents the download URL as /file/bot<token>/<file_path>.
+// Source: https://core.telegram.org/bots/api#getfile
+func (c *Client) DownloadFile(ctx context.Context, fileID string, maxBytes int64) ([]byte, error) {
+	if fileID == "" {
+		return nil, fmt.Errorf("Telegram file ID is required")
+	}
+	if maxBytes <= 0 {
+		return nil, fmt.Errorf("Telegram file size limit must be positive")
+	}
+	var file struct {
+		FileID   string `json:"file_id"`
+		FileSize int64  `json:"file_size"`
+		FilePath string `json:"file_path"`
+	}
+	if err := c.call(ctx, "getFile", struct {
+		FileID string `json:"file_id"`
+	}{FileID: fileID}, &file); err != nil {
+		return nil, fmt.Errorf("get Telegram file: %w", err)
+	}
+	if file.FileSize > maxBytes {
+		return nil, fmt.Errorf("Telegram file is %d bytes; limit is %d", file.FileSize, maxBytes)
+	}
+	cleanPath := path.Clean(file.FilePath)
+	if cleanPath == "." || strings.HasPrefix(cleanPath, "../") || path.IsAbs(cleanPath) {
+		return nil, fmt.Errorf("Telegram file path is invalid")
+	}
+	request, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodGet,
+		c.baseURL+"/file/bot"+c.token+"/"+cleanPath,
+		nil,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("create Telegram file request: %w", err)
+	}
+	response, err := c.httpClient.Do(request)
+	if err != nil {
+		return nil, fmt.Errorf("download Telegram file: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return nil, fmt.Errorf("download Telegram file: HTTP %d", response.StatusCode)
+	}
+	if response.ContentLength > maxBytes {
+		return nil, fmt.Errorf("Telegram file response is %d bytes; limit is %d", response.ContentLength, maxBytes)
+	}
+	data, err := io.ReadAll(io.LimitReader(response.Body, maxBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read Telegram file: %w", err)
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, fmt.Errorf("Telegram file exceeds %d-byte limit", maxBytes)
+	}
+	return data, nil
 }
 
 // BanChatMember permanently removes a user from a group, supergroup, or channel.

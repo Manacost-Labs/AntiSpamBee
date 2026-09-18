@@ -12,6 +12,11 @@ type config struct {
 	OpenRouterAPIKey  string
 	OpenRouterBaseURL string
 	OpenRouterModel   string
+	OCREnabled        bool
+	OCRExecutable     string
+	OCRLanguage       string
+	OCRMaxBytes       int64
+	OCRTimeout        time.Duration
 	NATSURL           string
 	Stream            string
 	Subject           string
@@ -31,6 +36,30 @@ func loadConfig(getenv func(string) string) (config, error) {
 		return config{}, fmt.Errorf("TELEGRAM_BOT_TOKEN is required")
 	}
 	openRouterAPIKey := getenv("OPENROUTER_API_KEY")
+	ocrEnabled := false
+	if raw := getenv("OCR_ENABLED"); raw != "" {
+		parsed, err := strconv.ParseBool(raw)
+		if err != nil {
+			return config{}, fmt.Errorf("OCR_ENABLED must be true or false")
+		}
+		ocrEnabled = parsed
+	}
+	ocrMaxBytes := int64(8 << 20)
+	if raw := getenv("OCR_MAX_BYTES"); raw != "" {
+		parsed, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || parsed <= 0 || parsed > 20<<20 {
+			return config{}, fmt.Errorf("OCR_MAX_BYTES must be between 1 and 20971520")
+		}
+		ocrMaxBytes = parsed
+	}
+	ocrTimeout := 12 * time.Second
+	if raw := getenv("OCR_TIMEOUT"); raw != "" {
+		parsed, err := time.ParseDuration(raw)
+		if err != nil || parsed <= 0 || parsed > time.Minute {
+			return config{}, fmt.Errorf("OCR_TIMEOUT must be between 1ns and 1m")
+		}
+		ocrTimeout = parsed
+	}
 	var moderatorChatID int64
 	if raw := getenv("MODERATOR_CHAT_ID"); raw != "" {
 		parsed, err := strconv.ParseInt(raw, 10, 64)
@@ -46,6 +75,11 @@ func loadConfig(getenv func(string) string) (config, error) {
 		OpenRouterAPIKey:  openRouterAPIKey,
 		OpenRouterBaseURL: valueOrDefault(getenv("OPENROUTER_BASE_URL"), "https://openrouter.ai"),
 		OpenRouterModel:   valueOrDefault(getenv("OPENROUTER_MODEL"), "~typesafe/jev-latest"),
+		OCREnabled:        ocrEnabled,
+		OCRExecutable:     valueOrDefault(getenv("OCR_EXECUTABLE"), "tesseract"),
+		OCRLanguage:       valueOrDefault(getenv("OCR_LANGUAGE"), "rus+eng"),
+		OCRMaxBytes:       ocrMaxBytes,
+		OCRTimeout:        ocrTimeout,
 		NATSURL:           valueOrDefault(getenv("NATS_URL"), "nats://127.0.0.1:4222"),
 		Stream:            valueOrDefault(getenv("NATS_STREAM"), "TELEGRAM_EVENTS"),
 		Subject:           valueOrDefault(getenv("NATS_SUBJECT"), "telegram.events"),

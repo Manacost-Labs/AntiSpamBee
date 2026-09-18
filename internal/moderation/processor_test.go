@@ -7,6 +7,7 @@ import (
 
 	"antispambee/internal/detection"
 	"antispambee/internal/events"
+	"antispambee/internal/telegramapi"
 )
 
 type recordingStore struct {
@@ -58,6 +59,19 @@ type profileFetcherStub struct {
 type semanticAdStub struct {
 	signal  detection.Signal
 	content detection.SemanticAdContent
+}
+
+type imageTextExtractorStub struct {
+	text   string
+	err    error
+	fileID string
+	calls  int
+}
+
+func (s *imageTextExtractorStub) ExtractText(_ context.Context, fileID string) (string, error) {
+	s.calls++
+	s.fileID = fileID
+	return s.text, s.err
 }
 
 func (s *semanticAdStub) AnalyzeAdvertising(_ context.Context, content detection.SemanticAdContent) detection.Signal {
@@ -395,6 +409,170 @@ func TestProcessorDeletesAdvertisingMessageSentAsChannel(t *testing.T) {
 	}
 }
 
+func TestProcessorDeletesAdvertisingChannelPost(t *testing.T) {
+	store := &recordingStore{}
+	fetcher := &profileFetcherStub{}
+	processor, err := NewProcessor(store, fetcher, detection.NewProfileDetector())
+	if err != nil {
+		t.Fatalf("NewProcessor() error = %v", err)
+	}
+	event := telegramEvent(`{
+		"channel_post": {
+			"message_id": 96,
+			"chat": {"id": -100777, "type": "channel"},
+			"text": "Подпишись на наш канал t.me/best_channel",
+			"entities": [{"type": "url", "offset": 23, "length": 25}]
+		}
+	}`)
+
+	if err := processor.Process(context.Background(), event); err != nil {
+		t.Fatalf("Process() error = %v", err)
+	}
+
+	if store.outcome.State != DecidedPendingAction {
+		t.Fatalf("terminal state = %q, want %q", store.outcome.State, DecidedPendingAction)
+	}
+	if !hasAction(store.outcome, ActionDeleteMessage) {
+		t.Fatalf("actions = %#v, want DELETE_MESSAGE", store.outcome.Actions)
+	}
+	if fetcher.calls != 0 {
+		t.Fatalf("profile fetch calls = %d, want 0 for channel_post", fetcher.calls)
+	}
+	if store.outcome.Input.UpdateKind != "channel_post" || store.outcome.Input.TextLength == 0 || !store.outcome.Input.HasLink {
+		t.Fatalf("input features = %#v", store.outcome.Input)
+	}
+}
+
+func TestProcessorRecordsPrivacySafeFeaturesForImageOnlyMessage(t *testing.T) {
+	store := &recordingStore{}
+	processor, err := NewProcessor(store, &profileFetcherStub{}, detection.NewProfileDetector())
+	if err != nil {
+		t.Fatal(err)
+	}
+	event := telegramEvent(`{
+		"message": {
+			"message_id": 97,
+			"from": {"id": 42},
+			"chat": {"id": -100777, "type": "supergroup"},
+			"photo": [{"file_id": "small"}, {"file_id": "large"}]
+		}
+	}`)
+
+	if err := processor.Process(context.Background(), event); err != nil {
+		t.Fatalf("Process() error = %v", err)
+	}
+
+	if store.outcome.Input.UpdateKind != "message" || store.outcome.Input.TextLength != 0 || store.outcome.Input.HasLink {
+		t.Fatalf("input features = %#v", store.outcome.Input)
+	}
+	if len(store.outcome.Input.MediaTypes) != 1 || store.outcome.Input.MediaTypes[0] != "photo" {
+		t.Fatalf("media types = %v, want [photo]", store.outcome.Input.MediaTypes)
+	}
+	if store.outcome.Input.ContentFingerprint == "" {
+		t.Fatal("content fingerprint is empty")
+	}
+}
+
+func TestProcessorDeletesImageOnlyAdvertisementUsingOCR(t *testing.T) {
+	store := &recordingStore{}
+	ocr := &imageTextExtractorStub{text: "ИЩЕМ ПОДРАБОТКУ 5000 РУБЛЕЙ В ЛС"}
+	processor, err := NewProcessor(
+		store,
+		&profileFetcherStub{},
+		detection.NewProfileDetector(),
+		WithImageTextExtractor(ocr),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	event := telegramEvent(`{
+		"message": {
+			"message_id": 98,
+			"from": {"id": 42},
+			"chat": {"id": -100777, "type": "supergroup"},
+			"photo": [
+				{"file_id": "small", "file_size": 100},
+				{"file_id": "large", "file_size": 1000}
+			]
+		}
+	}`)
+
+	if err := processor.Process(context.Background(), event); err != nil {
+		t.Fatalf("Process() error = %v", err)
+	}
+	if ocr.calls != 1 || ocr.fileID != "large" {
+		t.Fatalf("OCR calls/file = %d/%q, want 1/large", ocr.calls, ocr.fileID)
+	}
+	if !hasAction(store.outcome, ActionDeleteMessage) {
+		t.Fatalf("actions = %#v, want DELETE_MESSAGE", store.outcome.Actions)
+	}
+	if store.outcome.Input.OCRTextLength == 0 {
+		t.Fatal("OCR text length was not recorded")
+	}
+}
+
+func TestProcessorRetriesImageOnlyMessageWhenOCRFails(t *testing.T) {
+	store := &recordingStore{}
+	ocr := &imageTextExtractorStub{err: &telegramapi.APIError{ErrorCode: 503, Description: "OCR download unavailable"}}
+	processor, err := NewProcessor(
+		store,
+		&profileFetcherStub{},
+		detection.NewProfileDetector(),
+		WithImageTextExtractor(ocr),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	event := telegramEvent(`{
+		"message": {
+			"message_id": 99,
+			"from": {"id": 42},
+			"chat": {"id": -100777, "type": "supergroup"},
+			"photo": [{"file_id": "image", "file_size": 1000}]
+		}
+	}`)
+
+	if err := processor.Process(context.Background(), event); err == nil {
+		t.Fatal("Process() error = nil, want OCR retry")
+	}
+	if store.event.EventID != "" {
+		t.Fatal("terminal outcome recorded before OCR retry")
+	}
+}
+
+func TestProcessorReviewsImageWhenOCRPermanentlyFails(t *testing.T) {
+	store := &recordingStore{}
+	ocr := &imageTextExtractorStub{err: errors.New("unsupported image")}
+	processor, err := NewProcessor(
+		store,
+		&profileFetcherStub{},
+		detection.NewProfileDetector(),
+		WithImageTextExtractor(ocr),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	event := telegramEvent(`{
+		"message": {
+			"message_id": 100,
+			"from": {"id": 42},
+			"chat": {"id": -100777, "type": "supergroup"},
+			"photo": [{"file_id": "broken", "file_size": 1000}]
+		}
+	}`)
+
+	if err := processor.Process(context.Background(), event); err != nil {
+		t.Fatalf("Process() error = %v", err)
+	}
+	if store.outcome.State != ProcessedReview || store.outcome.Decision.AuthorizedAction != ActionReview {
+		t.Fatalf("outcome = %#v, want REVIEW", store.outcome)
+	}
+	ocrSignal := signalByDetector(t, store.outcome, "image.ocr")
+	if ocrSignal.Status != detection.StatusError {
+		t.Fatalf("OCR status = %q, want ERROR", ocrSignal.Status)
+	}
+}
+
 func TestProcessorRetriesWhenHighRiskMemberStatusIsUnavailable(t *testing.T) {
 	store := &recordingStore{}
 	fetcher := &profileFetcherStub{memberErr: errors.New("telegram unavailable")}
@@ -548,6 +726,18 @@ func TestMessageContentExtractsCaptionAndHiddenLink(t *testing.T) {
 	}
 }
 
+func TestMessageContentRecognizesObfuscatedTelegramLink(t *testing.T) {
+	content := messageContent([]byte(`{
+		"message": {
+			"text": "Подпишись t[.]me/example"
+		}
+	}`))
+
+	if !content.HasLink {
+		t.Fatal("HasLink = false, want true for t[.]me")
+	}
+}
+
 func TestProcessorDoesNotRaiseRiskWhenProfileFetchFails(t *testing.T) {
 	store := &recordingStore{}
 	processor, err := NewProcessor(
@@ -581,6 +771,60 @@ func signalByDetector(t *testing.T, outcome Outcome, detector string) detection.
 	}
 	t.Fatalf("detector %q not found in %#v", detector, outcome.Signals)
 	return detection.Signal{}
+}
+
+func TestProcessorRetriesOrdinaryMessageWhenProfileFetchTemporarilyFails(t *testing.T) {
+	store := &recordingStore{}
+	fetcher := &profileFetcherStub{err: &telegramapi.APIError{
+		ErrorCode:   503,
+		Description: "upstream unavailable",
+	}}
+	processor, err := NewProcessor(store, fetcher, detection.NewProfileDetector())
+	if err != nil {
+		t.Fatal(err)
+	}
+	event := telegramEvent(`{
+		"message": {
+			"message_id": 101,
+			"from": {"id": 42},
+			"chat": {"id": -100777, "type": "supergroup"},
+			"text": "Обычное сообщение"
+		}
+	}`)
+
+	if err := processor.Process(context.Background(), event); err == nil {
+		t.Fatal("Process() error = nil, want retryable profile error")
+	}
+	if store.event.EventID != "" {
+		t.Fatal("terminal outcome recorded before transient profile retry")
+	}
+}
+
+func TestProcessorDeletesTextSpamDespiteTemporaryProfileFailure(t *testing.T) {
+	store := &recordingStore{}
+	fetcher := &profileFetcherStub{err: &telegramapi.APIError{
+		ErrorCode:   503,
+		Description: "upstream unavailable",
+	}}
+	processor, err := NewProcessor(store, fetcher, detection.NewProfileDetector())
+	if err != nil {
+		t.Fatal(err)
+	}
+	event := telegramEvent(`{
+		"message": {
+			"message_id": 102,
+			"from": {"id": 42},
+			"chat": {"id": -100777, "type": "supergroup"},
+			"text": "ИЩЕМ ПОДРАБОТКУ 5000 РУБЛЕЙ В ЛС"
+		}
+	}`)
+
+	if err := processor.Process(context.Background(), event); err != nil {
+		t.Fatalf("Process() error = %v", err)
+	}
+	if !hasAction(store.outcome, ActionDeleteMessage) {
+		t.Fatalf("actions = %#v, want DELETE_MESSAGE", store.outcome.Actions)
+	}
 }
 
 func TestProcessorReturnsStorageFailure(t *testing.T) {

@@ -53,8 +53,7 @@ services:
   moderation-worker:
     build:
       context: .
-      dockerfile: docker/Dockerfile
-      args: {TARGET: moderation-worker}
+      dockerfile: docker/Dockerfile.moderation-worker
     env_file: ${ENV_FILE:-.env}
     environment:
       DATABASE_URL: postgres://antispambee@postgres:5432/antispambee?sslmode=disable

@@ -110,6 +110,55 @@ func TestClientFetchProfileReturnsTelegramError(t *testing.T) {
 	}
 }
 
+func TestClientDownloadsTelegramFileWithinLimit(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/botsecret/getFile":
+			_, _ = w.Write([]byte(`{"ok":true,"result":{"file_id":"image","file_size":5,"file_path":"photos/ad.jpg"}}`))
+		case "/file/botsecret/photos/ad.jpg":
+			_, _ = w.Write([]byte("image"))
+		default:
+			t.Fatalf("unexpected path %q", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+	client, err := NewClient(ClientConfig{Token: "secret", BaseURL: server.URL, HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	data, err := client.DownloadFile(context.Background(), "image", 10)
+	if err != nil {
+		t.Fatalf("DownloadFile() error = %v", err)
+	}
+	if string(data) != "image" {
+		t.Fatalf("DownloadFile() data = %q", data)
+	}
+}
+
+func TestClientRejectsTelegramFileAboveLimitBeforeDownload(t *testing.T) {
+	downloaded := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/botsecret/getFile" {
+			_, _ = w.Write([]byte(`{"ok":true,"result":{"file_id":"image","file_size":11,"file_path":"photos/ad.jpg"}}`))
+			return
+		}
+		downloaded = true
+	}))
+	defer server.Close()
+	client, err := NewClient(ClientConfig{Token: "secret", BaseURL: server.URL, HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := client.DownloadFile(context.Background(), "image", 10); err == nil {
+		t.Fatal("DownloadFile() error = nil, want size limit error")
+	}
+	if downloaded {
+		t.Fatal("oversized Telegram file was downloaded")
+	}
+}
+
 func TestClientBanChatMember(t *testing.T) {
 	var requestBody struct {
 		ChatID int64 `json:"chat_id"`

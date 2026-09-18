@@ -38,6 +38,41 @@ func TestLoadConfigUsesSafeDefaults(t *testing.T) {
 	if config.HTTPAddress != ":8082" {
 		t.Errorf("HTTP address = %q", config.HTTPAddress)
 	}
+	if config.OCREnabled {
+		t.Fatal("OCR must be disabled by default")
+	}
+	if config.OCRMaxBytes != 8<<20 || config.OCRTimeout != 12*time.Second || config.OCRLanguage != "rus+eng" {
+		t.Fatalf("OCR defaults = %d/%s/%q", config.OCRMaxBytes, config.OCRTimeout, config.OCRLanguage)
+	}
+}
+
+func TestLoadConfigEnablesBoundedOCR(t *testing.T) {
+	values := map[string]string{
+		"DATABASE_URL":       "postgres://antispambee:secret@localhost:5432/antispambee",
+		"TELEGRAM_BOT_TOKEN": "123456:secret",
+		"OCR_ENABLED":        "true",
+		"OCR_MAX_BYTES":      "4194304",
+		"OCR_TIMEOUT":        "8s",
+		"OCR_LANGUAGE":       "rus+eng",
+	}
+	config, err := loadConfig(func(key string) string { return values[key] })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !config.OCREnabled || config.OCRMaxBytes != 4<<20 || config.OCRTimeout != 8*time.Second {
+		t.Fatalf("OCR config = %#v", config)
+	}
+}
+
+func TestLoadConfigRejectsInvalidOCRSettings(t *testing.T) {
+	values := map[string]string{
+		"DATABASE_URL":       "postgres://antispambee:secret@localhost:5432/antispambee",
+		"TELEGRAM_BOT_TOKEN": "123456:secret",
+		"OCR_ENABLED":        "sometimes",
+	}
+	if _, err := loadConfig(func(key string) string { return values[key] }); err == nil {
+		t.Fatal("loadConfig() error = nil, want invalid OCR setting error")
+	}
 }
 
 func TestLoadConfigRequiresDatabaseURL(t *testing.T) {

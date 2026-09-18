@@ -14,6 +14,7 @@ import (
 
 	"antispambee/internal/detection"
 	"antispambee/internal/eventstream"
+	"antispambee/internal/mediaocr"
 	"antispambee/internal/moderation"
 	"antispambee/internal/openrouter"
 	"antispambee/internal/postgresstore"
@@ -54,6 +55,18 @@ func run(ctx context.Context, config config) error {
 		})
 		if err != nil {
 			return err
+		}
+	}
+	var imageOCR *mediaocr.Extractor
+	if config.OCREnabled {
+		imageOCR, err = mediaocr.New(profiles, mediaocr.Config{
+			Executable: config.OCRExecutable,
+			Language:   config.OCRLanguage,
+			MaxBytes:   config.OCRMaxBytes,
+			Timeout:    config.OCRTimeout,
+		})
+		if err != nil {
+			return fmt.Errorf("configure image OCR: %w", err)
 		}
 	}
 
@@ -98,7 +111,7 @@ func run(ctx context.Context, config config) error {
 		)
 		if err == nil {
 			cancelProvision()
-			return consume(ctx, consumer, pool, profiles, semantic, config.RetryDelay, config.ModeratorChatID, config.HTTPAddress)
+			return consume(ctx, consumer, pool, profiles, semantic, imageOCR, config.RetryDelay, config.ModeratorChatID, config.HTTPAddress)
 		}
 	}
 	cancelProvision()
@@ -111,6 +124,7 @@ func consume(
 	pool *pgxpool.Pool,
 	profiles *telegramapi.Client,
 	semantic *openrouter.Client,
+	imageOCR *mediaocr.Extractor,
 	retryDelay time.Duration,
 	moderatorChatID int64,
 	httpAddress string,
@@ -125,6 +139,9 @@ func consume(
 	}
 	if semantic != nil {
 		options = append(options, moderation.WithSemanticAnalyzer(semantic))
+	}
+	if imageOCR != nil {
+		options = append(options, moderation.WithImageTextExtractor(imageOCR))
 	}
 	processor, err := moderation.NewProcessor(store, profiles, detection.NewProfileDetector(), options...)
 	if err != nil {
