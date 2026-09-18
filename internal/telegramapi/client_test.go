@@ -316,6 +316,9 @@ func TestClientGetBotUsername(t *testing.T) {
 
 func TestClientSendMessageWithURLButton(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/botsecret/sendMessage" {
+			t.Fatalf("path = %q", r.URL.Path)
+		}
 		var request struct {
 			ChatID      int64  `json:"chat_id"`
 			Text        string `json:"text"`
