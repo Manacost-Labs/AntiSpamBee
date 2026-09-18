@@ -165,10 +165,22 @@ func detectCommercialPromotion(combined string, hasLink bool, rulePrefix string)
 		"обход блокировок",
 		"забудь про блокировки",
 	)
+	promotionClaim := containsAny(text,
+		"летают все соц сети",
+		"летают все соцсети",
+		"работают все соц сети",
+		"работают все соцсети",
+		"быстрый vpn",
+		"быстрый впн",
+		"только у нас",
+		"наш vpn",
+		"наш впн",
+	)
 
 	vpnPromotion := vpnMention && ((freeHook && (priceHook || activationHook || hasLink)) ||
 		(priceHook && (activationHook || hasLink)) ||
-		(activationHook && hasLink))
+		(activationHook && hasLink) ||
+		(promotionClaim && hasLink))
 	offerHook := containsAny(text,
 		"скидка",
 		"промокод",

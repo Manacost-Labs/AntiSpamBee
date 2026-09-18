@@ -312,6 +312,34 @@ func TestProcessorQueuesCompactJobPromotionDeletion(t *testing.T) {
 	}
 }
 
+func TestProcessorQueuesExclusiveVPNPromotionDeletionWithBareDomain(t *testing.T) {
+	store := &recordingStore{}
+	fetcher := &profileFetcherStub{profile: detection.Profile{Username: "spammer"}}
+	processor, err := NewProcessor(store, fetcher, detection.NewProfileDetector())
+	if err != nil {
+		t.Fatalf("NewProcessor() error = %v", err)
+	}
+	event := telegramEvent(`{
+		"message": {
+			"message_id": 93,
+			"from": {"id": 42},
+			"chat": {"id": -100777, "type": "supergroup"},
+			"text": "VPN с которым летают все соц сети только у нас vpn.ru"
+		}
+	}`)
+
+	if err := processor.Process(context.Background(), event); err != nil {
+		t.Fatalf("Process() error = %v", err)
+	}
+
+	if store.outcome.State != DecidedPendingAction {
+		t.Fatalf("terminal state = %q, want %q", store.outcome.State, DecidedPendingAction)
+	}
+	if store.outcome.Action == nil || store.outcome.Action.Type != ActionDeleteMessage {
+		t.Fatalf("action = %#v, want DELETE_MESSAGE", store.outcome.Action)
+	}
+}
+
 func TestProcessorKeepsHighRiskPrivateMessageForReview(t *testing.T) {
 	store := &recordingStore{}
 	fetcher := &profileFetcherStub{profile: detection.Profile{Username: "spammer"}}

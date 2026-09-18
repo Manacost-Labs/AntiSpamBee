@@ -322,7 +322,7 @@ func messageContent(payload json.RawMessage) detection.MessageContent {
 	return detection.MessageContent{}
 }
 
-var messageURLPattern = regexp.MustCompile(`(?i)(?:https?://[^\s<>"']+|(?:t|telegram)\.me/[a-z0-9_/?=&.%-]+)`)
+var messageURLPattern = regexp.MustCompile(`(?i)(?:https?://[^\s<>"']+|(?:t|telegram)\.me/[a-z0-9_/?=&.%-]+|(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:ru|com|net|org|io|me|ai|app|site|online|xyz)(?:/[^\s<>"']*)?)`)
 
 func extractURLs(value string) []string {
 	matches := messageURLPattern.FindAllString(value, -1)

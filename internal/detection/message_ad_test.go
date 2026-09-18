@@ -62,6 +62,25 @@ func TestMessageAdDetectorFlagsVPNOfferBehindTextLink(t *testing.T) {
 	}
 }
 
+func TestMessageAdDetectorFlagsExclusiveVPNPerformanceClaim(t *testing.T) {
+	detector := newMessageAdDetector(time.Now)
+
+	signal := detector.Analyze(MessageContent{
+		Text:    "VPN с которым летают все соц сети только у нас vpn.ru",
+		HasLink: true,
+	})
+
+	if signal.Score == nil || *signal.Score < 0.9 || *signal.Score >= 1 {
+		t.Fatalf("score = %v, want delete-only risk in [0.9, 1)", signal.Score)
+	}
+	if !slices.Contains(signal.ReasonCodes, ReasonVPNPromotion) {
+		t.Errorf("reason codes = %v, want %q", signal.ReasonCodes, ReasonVPNPromotion)
+	}
+	if !slices.Contains(signal.MatchedRules, "MESSAGE_AD_VPN_01") {
+		t.Errorf("matched rules = %v, want MESSAGE_AD_VPN_01", signal.MatchedRules)
+	}
+}
+
 func TestMessageAdDetectorFlagsGenericCommercialOffer(t *testing.T) {
 	detector := newMessageAdDetector(time.Now)
 
