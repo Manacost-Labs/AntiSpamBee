@@ -30,6 +30,17 @@ type Client struct {
 	httpClient *http.Client
 }
 
+// APIError is a structured Telegram failure suitable for retry decisions.
+type APIError struct {
+	ErrorCode   int
+	Description string
+	RetryAfter  time.Duration
+}
+
+func (e *APIError) Error() string {
+	return fmt.Sprintf("Telegram API error %d: %s", e.ErrorCode, e.Description)
+}
+
 // NewClient creates a Bot API client without making a network request.
 func NewClient(config ClientConfig) (*Client, error) {
 	if config.Token == "" {
@@ -130,6 +141,76 @@ func (c *Client) BanChatMember(ctx context.Context, chatID, userID int64) error 
 	return nil
 }
 
+// DeleteMessage deletes one Telegram message.
+func (c *Client) DeleteMessage(ctx context.Context, chatID, messageID int64) error {
+	if chatID == 0 {
+		return fmt.Errorf("Telegram chat ID must not be zero")
+	}
+	if messageID <= 0 {
+		return fmt.Errorf("Telegram message ID must be positive")
+	}
+	var deleted bool
+	if err := c.call(ctx, "deleteMessage", struct {
+		ChatID    int64 `json:"chat_id"`
+		MessageID int64 `json:"message_id"`
+	}{ChatID: chatID, MessageID: messageID}, &deleted); err != nil {
+		return fmt.Errorf("delete Telegram message: %w", err)
+	}
+	if !deleted {
+		return fmt.Errorf("delete Telegram message: Telegram returned false")
+	}
+	return nil
+}
+
+// DeleteMessageReaction removes the specified user's reaction from a message.
+func (c *Client) DeleteMessageReaction(ctx context.Context, chatID, messageID, userID int64) error {
+	if chatID == 0 {
+		return fmt.Errorf("Telegram chat ID must not be zero")
+	}
+	if messageID <= 0 {
+		return fmt.Errorf("Telegram message ID must be positive")
+	}
+	if userID <= 0 {
+		return fmt.Errorf("Telegram user ID must be positive")
+	}
+	var deleted bool
+	if err := c.call(ctx, "deleteMessageReaction", struct {
+		ChatID    int64 `json:"chat_id"`
+		MessageID int64 `json:"message_id"`
+		UserID    int64 `json:"user_id"`
+	}{ChatID: chatID, MessageID: messageID, UserID: userID}, &deleted); err != nil {
+		return fmt.Errorf("delete Telegram message reaction: %w", err)
+	}
+	if !deleted {
+		return fmt.Errorf("delete Telegram message reaction: Telegram returned false")
+	}
+	return nil
+}
+
+// GetChatMemberStatus returns member, administrator, creator, restricted,
+// left, or kicked as reported by Telegram.
+func (c *Client) GetChatMemberStatus(ctx context.Context, chatID, userID int64) (string, error) {
+	if chatID == 0 {
+		return "", fmt.Errorf("Telegram chat ID must not be zero")
+	}
+	if userID <= 0 {
+		return "", fmt.Errorf("Telegram user ID must be positive")
+	}
+	var member struct {
+		Status string `json:"status"`
+	}
+	if err := c.call(ctx, "getChatMember", struct {
+		ChatID int64 `json:"chat_id"`
+		UserID int64 `json:"user_id"`
+	}{ChatID: chatID, UserID: userID}, &member); err != nil {
+		return "", fmt.Errorf("get Telegram chat member: %w", err)
+	}
+	if member.Status == "" {
+		return "", fmt.Errorf("get Telegram chat member: empty status")
+	}
+	return member.Status, nil
+}
+
 func (c *Client) call(ctx context.Context, method string, payload, result any) error {
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -157,12 +238,19 @@ func (c *Client) call(ctx context.Context, method string, payload, result any) e
 		Result      json.RawMessage `json:"result"`
 		ErrorCode   int             `json:"error_code"`
 		Description string          `json:"description"`
+		Parameters  struct {
+			RetryAfter int `json:"retry_after"`
+		} `json:"parameters"`
 	}
 	if err := json.NewDecoder(io.LimitReader(response.Body, 2<<20)).Decode(&envelope); err != nil {
 		return fmt.Errorf("decode response: %w", err)
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 || !envelope.OK {
-		return fmt.Errorf("Telegram API error %d: %s", envelope.ErrorCode, envelope.Description)
+		return &APIError{
+			ErrorCode:   envelope.ErrorCode,
+			Description: envelope.Description,
+			RetryAfter:  time.Duration(envelope.Parameters.RetryAfter) * time.Second,
+		}
 	}
 	if err := json.Unmarshal(envelope.Result, result); err != nil {
 		return fmt.Errorf("decode result: %w", err)

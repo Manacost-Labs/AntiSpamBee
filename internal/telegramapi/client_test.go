@@ -137,3 +137,82 @@ func TestClientBanChatMember(t *testing.T) {
 		t.Fatalf("request body = %#v", requestBody)
 	}
 }
+
+func TestClientDeleteMessage(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/botsecret/deleteMessage" {
+			t.Fatalf("path = %q", r.URL.Path)
+		}
+		var request struct {
+			ChatID    int64 `json:"chat_id"`
+			MessageID int64 `json:"message_id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		if request.ChatID != -100123 || request.MessageID != 77 {
+			t.Fatalf("request = %#v", request)
+		}
+		_, _ = w.Write([]byte(`{"ok":true,"result":true}`))
+	}))
+	defer server.Close()
+
+	client, err := NewClient(ClientConfig{Token: "secret", BaseURL: server.URL, HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.DeleteMessage(context.Background(), -100123, 77); err != nil {
+		t.Fatalf("DeleteMessage() error = %v", err)
+	}
+}
+
+func TestClientDeleteMessageReaction(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/botsecret/deleteMessageReaction" {
+			t.Fatalf("path = %q", r.URL.Path)
+		}
+		var request struct {
+			ChatID    int64 `json:"chat_id"`
+			MessageID int64 `json:"message_id"`
+			UserID    int64 `json:"user_id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		if request.ChatID != -100123 || request.MessageID != 77 || request.UserID != 42 {
+			t.Fatalf("request = %#v", request)
+		}
+		_, _ = w.Write([]byte(`{"ok":true,"result":true}`))
+	}))
+	defer server.Close()
+
+	client, err := NewClient(ClientConfig{Token: "secret", BaseURL: server.URL, HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.DeleteMessageReaction(context.Background(), -100123, 77, 42); err != nil {
+		t.Fatalf("DeleteMessageReaction() error = %v", err)
+	}
+}
+
+func TestClientGetChatMemberStatus(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/botsecret/getChatMember" {
+			t.Fatalf("path = %q", r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"ok":true,"result":{"status":"administrator","user":{"id":42,"is_bot":false,"first_name":"A"}}}`))
+	}))
+	defer server.Close()
+
+	client, err := NewClient(ClientConfig{Token: "secret", BaseURL: server.URL, HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, err := client.GetChatMemberStatus(context.Background(), -100123, 42)
+	if err != nil {
+		t.Fatalf("GetChatMemberStatus() error = %v", err)
+	}
+	if status != "administrator" {
+		t.Fatalf("status = %q", status)
+	}
+}

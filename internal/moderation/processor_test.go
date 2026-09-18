@@ -3,7 +3,6 @@ package moderation
 import (
 	"context"
 	"errors"
-	"strings"
 	"testing"
 
 	"antispambee/internal/detection"
@@ -23,17 +22,12 @@ func (s *recordingStore) RecordTerminal(_ context.Context, event events.Telegram
 }
 
 type profileFetcherStub struct {
-	profile detection.Profile
-	err     error
-	userID  int64
-	calls   int
-	banErr  error
-	banned  []banTarget
-}
-
-type banTarget struct {
-	chatID int64
-	userID int64
+	profile      detection.Profile
+	err          error
+	userID       int64
+	calls        int
+	memberStatus string
+	memberErr    error
 }
 
 type semanticAdStub struct {
@@ -52,9 +46,11 @@ func (f *profileFetcherStub) FetchProfile(_ context.Context, userID int64) (dete
 	return f.profile, f.err
 }
 
-func (f *profileFetcherStub) BanChatMember(_ context.Context, chatID, userID int64) error {
-	f.banned = append(f.banned, banTarget{chatID: chatID, userID: userID})
-	return f.banErr
+func (f *profileFetcherStub) GetChatMemberStatus(_ context.Context, _, _ int64) (string, error) {
+	if f.memberStatus == "" {
+		return "member", f.memberErr
+	}
+	return f.memberStatus, f.memberErr
 }
 
 func TestProcessorRecordsReviewForProfileJobSpam(t *testing.T) {
@@ -208,9 +204,6 @@ func TestProcessorRecordsJevSignalInShadowMode(t *testing.T) {
 	if store.outcome.State != ProcessedAllow {
 		t.Fatalf("terminal state = %q, want shadow ALLOW", store.outcome.State)
 	}
-	if len(fetcher.banned) != 0 {
-		t.Fatalf("banned targets = %#v, want none from shadow signal", fetcher.banned)
-	}
 	jevSignal := signalByDetector(t, store.outcome, "model.jev_advertising")
 	if jevSignal.Score == nil || *jevSignal.Score != 0.97 {
 		t.Fatalf("Jev score = %v", jevSignal.Score)
@@ -223,7 +216,11 @@ func TestProcessorRecordsJevSignalInShadowMode(t *testing.T) {
 func TestProcessorChecksProfileOfUserWhoAddsReaction(t *testing.T) {
 	store := &recordingStore{}
 	fetcher := &profileFetcherStub{profile: detection.Profile{
-		Bio: "Казино: бонус за депозит — забрать по ссылке t.me/win",
+		PersonalChannel: &detection.PersonalChannel{
+			Title:       "Бонусы казино",
+			Description: "Казино: бонус за депозит — забрать по ссылке t.me/win",
+			RecentPosts: []string{"Регистрируйся и получи бонус"},
+		},
 	}}
 	processor, err := NewProcessor(store, fetcher, detection.NewProfileDetector())
 	if err != nil {
@@ -246,11 +243,11 @@ func TestProcessorChecksProfileOfUserWhoAddsReaction(t *testing.T) {
 	if fetcher.userID != 8373323792 {
 		t.Fatalf("fetched user ID = %d, want 8373323792", fetcher.userID)
 	}
-	if store.outcome.State != ProcessedAction {
-		t.Fatalf("terminal state = %q, want %q", store.outcome.State, ProcessedAction)
+	if store.outcome.State != DecidedPendingAction {
+		t.Fatalf("terminal state = %q, want %q", store.outcome.State, DecidedPendingAction)
 	}
-	if len(fetcher.banned) != 1 || fetcher.banned[0] != (banTarget{chatID: -100123, userID: 8373323792}) {
-		t.Fatalf("banned targets = %#v", fetcher.banned)
+	if store.outcome.Action == nil || store.outcome.Action.Type != ActionDeleteReaction {
+		t.Fatalf("action = %#v, want DELETE_REACTION", store.outcome.Action)
 	}
 	profileSignal := signalByDetector(t, store.outcome, "profile.personal_channel")
 	if profileSignal.Score == nil || *profileSignal.Score < 0.9 {
@@ -258,7 +255,7 @@ func TestProcessorChecksProfileOfUserWhoAddsReaction(t *testing.T) {
 	}
 }
 
-func TestProcessorAutoBansSenderOfHighRiskMessage(t *testing.T) {
+func TestProcessorQueuesMessageDeletionAtHighRisk(t *testing.T) {
 	store := &recordingStore{}
 	fetcher := &profileFetcherStub{profile: detection.Profile{Username: "spammer"}}
 	processor, err := NewProcessor(store, fetcher, detection.NewProfileDetector())
@@ -267,6 +264,7 @@ func TestProcessorAutoBansSenderOfHighRiskMessage(t *testing.T) {
 	}
 	event := telegramEvent(`{
 		"message": {
+			"message_id": 91,
 			"from": {"id": 42},
 			"chat": {"id": -100777, "type": "supergroup"},
 			"text": "Казино: бонус 500% за депозит. Забрать по ссылке",
@@ -278,11 +276,11 @@ func TestProcessorAutoBansSenderOfHighRiskMessage(t *testing.T) {
 		t.Fatalf("Process() error = %v", err)
 	}
 
-	if store.outcome.State != ProcessedAction {
-		t.Fatalf("terminal state = %q, want %q", store.outcome.State, ProcessedAction)
+	if store.outcome.State != DecidedPendingAction {
+		t.Fatalf("terminal state = %q, want %q", store.outcome.State, DecidedPendingAction)
 	}
-	if len(fetcher.banned) != 1 || fetcher.banned[0] != (banTarget{chatID: -100777, userID: 42}) {
-		t.Fatalf("banned targets = %#v", fetcher.banned)
+	if store.outcome.Action == nil || store.outcome.Action.Type != ActionDeleteMessage {
+		t.Fatalf("action = %#v, want DELETE_MESSAGE", store.outcome.Action)
 	}
 }
 
@@ -309,16 +307,17 @@ func TestProcessorKeepsHighRiskPrivateMessageForReview(t *testing.T) {
 	if store.outcome.State != ProcessedReview {
 		t.Fatalf("terminal state = %q, want %q", store.outcome.State, ProcessedReview)
 	}
-	if len(fetcher.banned) != 0 {
-		t.Fatalf("banned targets = %#v, want none", fetcher.banned)
-	}
 }
 
-func TestProcessorRetriesWhenAutoBanFails(t *testing.T) {
+func TestProcessorKeepsProtectedMemberForReview(t *testing.T) {
 	store := &recordingStore{}
 	fetcher := &profileFetcherStub{
-		profile: detection.Profile{Username: "spammer"},
-		banErr:  errors.New("Telegram forbidden"),
+		profile: detection.Profile{PersonalChannel: &detection.PersonalChannel{
+			Title:       "Работа",
+			Description: "Нужны сотрудники на частичную занятость, высокий доход. Пишите в личку",
+			RecentPosts: []string{"Ищем людей, заработок без вложений"},
+		}},
+		memberStatus: "administrator",
 	}
 	processor, err := NewProcessor(store, fetcher, detection.NewProfileDetector())
 	if err != nil {
@@ -326,19 +325,18 @@ func TestProcessorRetriesWhenAutoBanFails(t *testing.T) {
 	}
 	event := telegramEvent(`{
 		"message": {
+			"message_id": 92,
 			"from": {"id": 42},
 			"chat": {"id": -100777, "type": "supergroup"},
-			"text": "Казино: бонус 500% за депозит. Забрать по ссылке",
-			"entities": [{"type": "text_link", "offset": 0, "length": 6, "url": "https://example.test"}]
+			"text": "Привет"
 		}
 	}`)
 
-	err = processor.Process(context.Background(), event)
-	if err == nil || !strings.Contains(err.Error(), "ban Telegram user") {
-		t.Fatalf("Process() error = %v, want ban failure", err)
+	if err := processor.Process(context.Background(), event); err != nil {
+		t.Fatalf("Process() error = %v", err)
 	}
-	if store.outcome.State != "" {
-		t.Fatalf("recorded state = %q, want no terminal record", store.outcome.State)
+	if store.outcome.State != ProcessedReview || store.outcome.Action != nil {
+		t.Fatalf("outcome = %#v, want protected REVIEW", store.outcome)
 	}
 }
 
@@ -361,9 +359,6 @@ func TestProcessorHandlesInlineCallbackWithoutChat(t *testing.T) {
 
 	if store.outcome.State != ProcessedReview {
 		t.Fatalf("terminal state = %q, want %q", store.outcome.State, ProcessedReview)
-	}
-	if len(fetcher.banned) != 0 {
-		t.Fatalf("banned targets = %#v, want none", fetcher.banned)
 	}
 }
 

@@ -1,6 +1,7 @@
 package moderation
 
 import (
+	"fmt"
 	"strings"
 
 	"antispambee/internal/detection"
@@ -41,6 +42,17 @@ type ActionTarget struct {
 	ChatID    int64
 	UserID    int64
 	MessageID int64
+}
+
+// ClaimedAction is a leased database action ready for one execution attempt.
+type ClaimedAction struct {
+	ActionID     string
+	EventID      string
+	TenantID     string
+	LeaseOwner   string
+	Type         ActionType
+	Target       ActionTarget
+	AttemptCount int
 }
 
 // DecisionInput is the complete, already-enriched input to the decision engine.
@@ -124,5 +136,18 @@ func recommendedAction(score float64, kind TargetKind) ActionType {
 		return ActionDeleteReaction
 	default:
 		return ActionReview
+	}
+}
+
+func actionIdempotencyKey(eventID string, action ActionType, target ActionTarget) string {
+	switch action {
+	case ActionBanUser:
+		return fmt.Sprintf("ban:%d:%d:%s", target.ChatID, target.UserID, eventID)
+	case ActionDeleteReaction:
+		return fmt.Sprintf("delete-reaction:%d:%d:%d:%s", target.ChatID, target.MessageID, target.UserID, eventID)
+	case ActionDeleteMessage:
+		return fmt.Sprintf("delete-message:%d:%d:%s", target.ChatID, target.MessageID, eventID)
+	default:
+		return ""
 	}
 }

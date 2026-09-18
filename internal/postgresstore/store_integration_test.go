@@ -26,7 +26,7 @@ func TestStoreRecordTerminalIsIdempotent(t *testing.T) {
 	}
 	t.Cleanup(pool.Close)
 
-	if _, err := pool.Exec(ctx, "TRUNCATE detector_signals, moderation_events"); err != nil {
+	if _, err := pool.Exec(ctx, "TRUNCATE moderation_audit_log, moderation_actions, moderation_decisions, detector_signals, moderation_events"); err != nil {
 		t.Fatalf("truncate moderation_events: %v", err)
 	}
 
@@ -50,7 +50,22 @@ func TestStoreRecordTerminalIsIdempotent(t *testing.T) {
 	jevConfidence := 0.91
 	confidence := 0.95
 	outcome := moderation.Outcome{
-		State: moderation.ProcessedAction,
+		State: moderation.DecidedPendingAction,
+		Decision: moderation.Decision{
+			RiskScore:           0.95,
+			DecisionConfidence:  0.95,
+			EvidenceCoverage:    1,
+			RecommendedAction:   moderation.ActionDeleteMessage,
+			AuthorizedAction:    moderation.ActionDeleteMessage,
+			AuthorizationReason: moderation.ReasonLikelyAdvertising,
+		},
+		Action: &moderation.ActionRequest{
+			Type: moderation.ActionDeleteMessage,
+			Target: moderation.ActionTarget{
+				Kind: moderation.TargetMessage, ChatID: -100777, UserID: 42, MessageID: 91,
+			},
+			IdempotencyKey: "delete-message:-100777:91:82373d0f-5740-5f07-b4e8-02c2f4edd824",
+		},
 		Signals: []detection.Signal{
 			{
 				SchemaVersion:    "1",
@@ -124,8 +139,8 @@ func TestStoreRecordTerminalIsIdempotent(t *testing.T) {
 	if tenantID != event.TenantID {
 		t.Errorf("tenant ID = %q, want %q", tenantID, event.TenantID)
 	}
-	if state != string(moderation.ProcessedAction) {
-		t.Errorf("terminal state = %q, want %q", state, moderation.ProcessedAction)
+	if state != string(moderation.DecidedPendingAction) {
+		t.Errorf("terminal state = %q, want %q", state, moderation.DecidedPendingAction)
 	}
 
 	var (
@@ -166,5 +181,45 @@ func TestStoreRecordTerminalIsIdempotent(t *testing.T) {
 	}
 	if storedJevScore != jevScore {
 		t.Errorf("stored Jev score = %v, want first result %v", storedJevScore, jevScore)
+	}
+	var actionCount int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM moderation_actions WHERE event_id = $1`, event.EventID).Scan(&actionCount); err != nil {
+		t.Fatalf("count moderation actions: %v", err)
+	}
+	if actionCount != 1 {
+		t.Errorf("action count = %d, want 1", actionCount)
+	}
+
+	claimed, found, err := store.ClaimAction(ctx, "worker-1", 30*time.Second)
+	if err != nil || !found {
+		t.Fatalf("ClaimAction() = %#v, %v, %v", claimed, found, err)
+	}
+	if claimed.Type != moderation.ActionDeleteMessage || claimed.AttemptCount != 1 {
+		t.Fatalf("claimed action = %#v", claimed)
+	}
+	if _, found, err := store.ClaimAction(ctx, "worker-2", 30*time.Second); err != nil || found {
+		t.Fatalf("second ClaimAction() found/error = %v/%v, want leased action hidden", found, err)
+	}
+	if err := store.MarkActionRetryable(ctx, claimed, time.Now().Add(-time.Second), "temporary failure"); err != nil {
+		t.Fatalf("MarkActionRetryable() error = %v", err)
+	}
+	claimed, found, err = store.ClaimAction(ctx, "worker-2", 30*time.Second)
+	if err != nil || !found || claimed.AttemptCount != 2 {
+		t.Fatalf("reclaimed action = %#v, %v, %v", claimed, found, err)
+	}
+	if err := store.MarkActionSucceeded(ctx, claimed, false); err != nil {
+		t.Fatalf("MarkActionSucceeded() error = %v", err)
+	}
+	var actionStatus, finalEventState string
+	if err := pool.QueryRow(ctx, `
+		SELECT a.status, e.terminal_state
+		FROM moderation_actions a
+		JOIN moderation_events e ON e.event_id = a.event_id
+		WHERE a.event_id = $1
+	`, event.EventID).Scan(&actionStatus, &finalEventState); err != nil {
+		t.Fatalf("query completed action: %v", err)
+	}
+	if actionStatus != "SUCCEEDED" || finalEventState != string(moderation.ProcessedAction) {
+		t.Fatalf("action/event status = %q/%q", actionStatus, finalEventState)
 	}
 }
