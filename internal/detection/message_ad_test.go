@@ -128,6 +128,48 @@ func TestMessageAdDetectorFlagsProhibitedAdTypes(t *testing.T) {
 	}
 }
 
+func TestMessageAdDetectorFlagsCompactJobPromotionWithAmountAndDirectMessageCTA(t *testing.T) {
+	detector := newMessageAdDetector(time.Now)
+
+	for _, text := range []string{
+		"ИЩЕМ ПОДРАБОТКУ 5000 РУБЛЕЙ В ЛС",
+		"Есть подработка — 5 000 руб. Пиши в личку",
+		"Требуются на подработку. Оплата 7500₽, подробности в директ",
+		"Подработка для всех от 3000 рублей, в личные сообщения",
+	} {
+		signal := detector.Analyze(MessageContent{Text: text})
+
+		if signal.Score == nil || *signal.Score < 0.9 || *signal.Score >= 1 {
+			t.Fatalf("text %q: score = %v, want delete-only risk in [0.9, 1)", text, signal.Score)
+		}
+		if !slices.Contains(signal.ReasonCodes, ReasonCommercialPromotion) {
+			t.Errorf("text %q: reason codes = %v, want %q", text, signal.ReasonCodes, ReasonCommercialPromotion)
+		}
+		if !slices.Contains(signal.ReasonCodes, ReasonMassJobOffer) {
+			t.Errorf("text %q: reason codes = %v, want %q", text, signal.ReasonCodes, ReasonMassJobOffer)
+		}
+		if !slices.Contains(signal.MatchedRules, "MESSAGE_AD_JOB_COMPACT_01") {
+			t.Errorf("text %q: matched rules = %v, want MESSAGE_AD_JOB_COMPACT_01", text, signal.MatchedRules)
+		}
+	}
+}
+
+func TestMessageAdDetectorDoesNotFlagIncompleteCompactJobPromotion(t *testing.T) {
+	detector := newMessageAdDetector(time.Now)
+
+	for _, text := range []string{
+		"Ищу подработку, готов обсудить условия",
+		"На прошлой подработке получил 5000 рублей",
+		"Ищем подработку для школьного проекта с бюджетом 5000 рублей",
+		"Ищем подработку, пишите в ЛС",
+	} {
+		signal := detector.Analyze(MessageContent{Text: text})
+		if signal.Score == nil || *signal.Score != 0 {
+			t.Errorf("text %q: score = %v, want 0", text, signal.Score)
+		}
+	}
+}
+
 func TestMessageAdDetectorDoesNotFlagNeutralSensitiveTopics(t *testing.T) {
 	detector := newMessageAdDetector(time.Now)
 

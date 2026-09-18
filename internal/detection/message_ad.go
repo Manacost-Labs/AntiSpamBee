@@ -1,9 +1,12 @@
 package detection
 
 import (
+	"regexp"
 	"strings"
 	"time"
 )
+
+var jobMoneyAmountPattern = regexp.MustCompile(`(?i)(?:[1-9][0-9]{2,6}|[1-9][0-9]{0,2}[ .][0-9]{3})\s*(?:₽|руб(?:лей|ля|ль)?\.?)`)
 
 const (
 	ReasonCommercialPromotion = "COMMERCIAL_PROMOTION"
@@ -91,6 +94,14 @@ func detectRestrictedMessagePromotion(combined string, hasLink bool) (float64, [
 		"пиши в личку", "пишите в личку", "пиши в лс", "пишите в лс", "подробности в лич",
 	)
 	jobPromotion := massRecruitment && employmentHook && (moneyHook || jobCTA || hasLink)
+	directJobPitch := massRecruitment || containsAny(text,
+		"ищем подработку", "предлагаем подработку", "есть подработка", "подработка для",
+		"подработка от", "требуется на подработку", "требуются на подработку", "набор на подработку",
+	)
+	directMessageCTA := jobCTA || containsAny(text,
+		"в лс", "в личку", "в личные сообщения", "в директ", "в личные",
+	)
+	compactJobPromotion := directJobPitch && jobMoneyAmountPattern.MatchString(combined) && directMessageCTA
 
 	adultMention := containsAny(text,
 		"onlyfans", "онлифанс", "нюдсы", "интимные фото", "интимные видео", "секс чат",
@@ -109,6 +120,13 @@ func detectRestrictedMessagePromotion(combined string, hasLink bool) (float64, [
 		score = 0.93
 		reasons = appendUnique(reasons, ReasonCommercialPromotion, ReasonMassJobOffer)
 		rules = append(rules, "MESSAGE_AD_JOB_01")
+	}
+	if compactJobPromotion {
+		if score < 0.97 {
+			score = 0.97
+		}
+		reasons = appendUnique(reasons, ReasonCommercialPromotion, ReasonMassJobOffer)
+		rules = append(rules, "MESSAGE_AD_JOB_COMPACT_01")
 	}
 	if adultPromotion {
 		if score < 0.95 {
