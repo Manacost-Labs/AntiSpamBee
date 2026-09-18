@@ -123,6 +123,19 @@ func TestClientAnalyzeAdvertisingSkipsEmptyContent(t *testing.T) {
 	}
 }
 
+func TestSemanticStateIncludesOCRText(t *testing.T) {
+	state, coverage := semanticState(detection.SemanticAdContent{
+		Message: detection.MessageContent{OCRText: "Бесплатный VPN — подключайся"},
+	})
+
+	if state["message_text"] != "Бесплатный VPN — подключайся" {
+		t.Fatalf("message_text = %#v", state["message_text"])
+	}
+	if coverage != 0.5 {
+		t.Fatalf("coverage = %v, want 0.5", coverage)
+	}
+}
+
 func TestClientAnalyzeAdvertisingRejectsInvalidConfidence(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(`{

@@ -229,7 +229,11 @@ func (c *Client) decide(ctx context.Context, state map[string]any) (decisionsRes
 
 func semanticState(content detection.SemanticAdContent) (map[string]any, float64) {
 	state := map[string]any{}
-	messageText := strings.TrimSpace(strings.Join([]string{content.Message.Text, content.Message.Caption}, " "))
+	messageText := strings.TrimSpace(strings.Join([]string{
+		content.Message.Text,
+		content.Message.Caption,
+		content.Message.OCRText,
+	}, " "))
 	if messageText != "" {
 		state["message_text"] = messageText
 		state["message_has_link"] = content.Message.HasLink
