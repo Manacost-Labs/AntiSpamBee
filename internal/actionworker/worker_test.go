@@ -3,6 +3,7 @@ package actionworker
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -50,6 +51,8 @@ type telegramStub struct {
 	reactionDeletes   int
 	mutes             int
 	unbans            int
+	messages          []string
+	sendMessageErr    error
 }
 
 func (t *telegramStub) BanChatMember(context.Context, int64, int64) error {
@@ -74,6 +77,10 @@ func (t *telegramStub) RestrictChatMember(context.Context, int64, int64, int64) 
 func (t *telegramStub) UnbanChatMember(context.Context, int64, int64) error {
 	t.unbans++
 	return nil
+}
+func (t *telegramStub) SendMessage(_ context.Context, _ int64, message string) error {
+	t.messages = append(t.messages, message)
+	return t.sendMessageErr
 }
 
 func TestWorkerExecutesDeleteReaction(t *testing.T) {
@@ -110,6 +117,48 @@ func TestWorkerExecutesUnban(t *testing.T) {
 	worked, err := worker.RunOnce(context.Background())
 	if err != nil || !worked || telegram.unbans != 1 || !repo.succeeded {
 		t.Fatalf("worked/error/unbans/succeeded = %v/%v/%d/%v", worked, err, telegram.unbans, repo.succeeded)
+	}
+}
+
+func TestWorkerNotifiesChatAfterSuccessfulBan(t *testing.T) {
+	repo := &repositoryStub{found: true, action: claimedAction(moderation.ActionBanUser, 1)}
+	telegram := &telegramStub{}
+	worker := newTestWorker(t, repo, telegram)
+
+	worked, err := worker.RunOnce(context.Background())
+	if err != nil || !worked || !repo.succeeded {
+		t.Fatalf("worked/error/succeeded = %v/%v/%v", worked, err, repo.succeeded)
+	}
+	if len(telegram.messages) != 1 || !strings.Contains(telegram.messages[0], "42") {
+		t.Fatalf("notifications = %q", telegram.messages)
+	}
+}
+
+func TestWorkerDoesNotAnnounceFailedBan(t *testing.T) {
+	repo := &repositoryStub{found: true, action: claimedAction(moderation.ActionBanUser, 1)}
+	telegram := &telegramStub{banErr: &telegramapi.APIError{ErrorCode: 403, Description: "Forbidden"}}
+	worker := newTestWorker(t, repo, telegram)
+
+	_, err := worker.RunOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(telegram.messages) != 0 {
+		t.Fatalf("notifications = %q", telegram.messages)
+	}
+}
+
+func TestWorkerKeepsSuccessfulBanWhenNotificationFails(t *testing.T) {
+	repo := &repositoryStub{found: true, action: claimedAction(moderation.ActionBanUser, 1)}
+	telegram := &telegramStub{sendMessageErr: errors.New("notification unavailable")}
+	worker := newTestWorker(t, repo, telegram)
+
+	worked, err := worker.RunOnce(context.Background())
+	if err != nil || !worked || !repo.succeeded || repo.retryError != "" || repo.permanentErr != "" {
+		t.Fatalf(
+			"worked/error/succeeded/retry/permanent = %v/%v/%v/%q/%q",
+			worked, err, repo.succeeded, repo.retryError, repo.permanentErr,
+		)
 	}
 }
 

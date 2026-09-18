@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"antispambee/internal/moderation"
@@ -39,6 +40,7 @@ type TelegramClient interface {
 	GetChatMemberStatus(context.Context, int64, int64) (string, error)
 	RestrictChatMember(context.Context, int64, int64, int64) error
 	UnbanChatMember(context.Context, int64, int64) error
+	SendMessage(context.Context, int64, string) error
 }
 
 // Worker leases and executes one durable moderation action at a time.
@@ -80,6 +82,12 @@ func (w *Worker) RunOnce(ctx context.Context) (bool, error) {
 	if err == nil {
 		if err := w.repository.MarkActionSucceeded(ctx, action, assumed); err != nil {
 			return true, fmt.Errorf("mark moderation action succeeded: %w", err)
+		}
+		if action.Type == moderation.ActionBanUser {
+			message := fmt.Sprintf("⛔ Пользователь %d заблокирован модерацией AntiSpamBee.", action.Target.UserID)
+			if err := w.telegram.SendMessage(ctx, action.Target.ChatID, message); err != nil {
+				slog.Warn("send Telegram ban notification failed", "action_id", action.ActionID, "error", err)
+			}
 		}
 		return true, nil
 	}
