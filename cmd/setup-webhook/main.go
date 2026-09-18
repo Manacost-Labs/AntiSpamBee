@@ -39,6 +39,7 @@ func defaultCommands() []telegramapi.BotCommand {
 		{Command: "help", Description: "Справочник по командам"},
 		{Command: "report", Description: "Пожаловаться на сообщение"},
 		{Command: "status", Description: "Показать режим защиты"},
+		{Command: "link", Description: "Привязать группу к личному кабинету"},
 		{Command: "protection", Description: "Изменить режим защиты"},
 		{Command: "allow", Description: "Добавить пользователя в исключения"},
 		{Command: "unallow", Description: "Убрать пользователя из исключений"},

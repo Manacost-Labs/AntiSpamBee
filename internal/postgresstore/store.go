@@ -64,7 +64,13 @@ func (s *Store) ClaimAction(
 			action.user_id,
 			action.message_id,
 			action.attempt_count,
-			COALESCE(action.until_date, 0)
+			COALESCE(action.until_date, 0),
+			action.notification_chat_id,
+			action.notification_author_username,
+			action.notification_author_user_id,
+			action.notification_message,
+			action.notification_reasons,
+			action.notification_risk_score
 	`, owner, lease.Milliseconds()).Scan(
 		&action.ActionID,
 		&action.EventID,
@@ -76,6 +82,12 @@ func (s *Store) ClaimAction(
 		&action.Target.MessageID,
 		&action.AttemptCount,
 		&action.UntilDate,
+		&action.Notification.ChatID,
+		&action.Notification.AuthorUsername,
+		&action.Notification.AuthorUserID,
+		&action.Notification.Message,
+		&action.Notification.Reasons,
+		&action.Notification.RiskScore,
 	)
 	if errorsIsNoRows(err) {
 		return moderation.ClaimedAction{}, false, nil
@@ -161,7 +173,10 @@ func (s *Store) finishAction(
 	command, err := tx.Exec(ctx, `
 		UPDATE moderation_actions
 		SET status = $3, last_error = NULLIF($4, ''), lease_owner = NULL,
-			lease_until = NULL, updated_at = now()
+			lease_until = NULL, notification_chat_id = 0,
+			notification_author_username = '', notification_author_user_id = 0,
+			notification_message = '', notification_reasons = '{}',
+			notification_risk_score = 0, updated_at = now()
 		WHERE action_id = $1 AND status = 'CLAIMED' AND lease_owner = $2
 	`, action.ActionID, action.LeaseOwner, actionStatus, message)
 	if err != nil {
@@ -295,6 +310,10 @@ func (s *Store) GetCommunityPolicy(
 				SELECT autoban_enabled FROM community_policies
 				WHERE tenant_id = $1 AND chat_id = $2
 			), TRUE),
+			COALESCE((
+				SELECT moderator_chat_id FROM community_policies
+				WHERE tenant_id = $1 AND chat_id = $2
+			), 0),
 			EXISTS (
 				SELECT 1 FROM moderation_allowlist
 				WHERE tenant_id = $1 AND chat_id = $2 AND user_id = $3
@@ -303,12 +322,118 @@ func (s *Store) GetCommunityPolicy(
 		&policy.ProtectionLevel,
 		&policy.AutomaticActionsEnabled,
 		&policy.AutobanEnabled,
+		&policy.ModeratorChatID,
 		&policy.IsAllowlisted,
 	)
 	if err != nil {
 		return moderation.CommunityPolicy{}, fmt.Errorf("query community moderation policy: %w", err)
 	}
 	return policy, nil
+}
+
+// ListCommunityPoliciesForModerator returns the communities connected to an
+// administrator's private chat. It is used for the personal /status command.
+func (s *Store) ListCommunityPoliciesForModerator(
+	ctx context.Context,
+	tenantID string,
+	moderatorChatID int64,
+) ([]moderation.CommunityPolicy, error) {
+	if tenantID == "" || moderatorChatID <= 0 {
+		return nil, fmt.Errorf("valid tenant and moderator are required")
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT chat_id, protection_level, automatic_actions_enabled, autoban_enabled, moderator_chat_id
+		FROM community_policies
+		WHERE tenant_id = $1 AND moderator_chat_id = $2
+		ORDER BY updated_at DESC, chat_id
+	`, tenantID, moderatorChatID)
+	if err != nil {
+		return nil, fmt.Errorf("list communities for moderator: %w", err)
+	}
+	defer rows.Close()
+	policies := make([]moderation.CommunityPolicy, 0)
+	for rows.Next() {
+		var policy moderation.CommunityPolicy
+		if err := rows.Scan(
+			&policy.ChatID,
+			&policy.ProtectionLevel,
+			&policy.AutomaticActionsEnabled,
+			&policy.AutobanEnabled,
+			&policy.ModeratorChatID,
+		); err != nil {
+			return nil, fmt.Errorf("scan community policy for moderator: %w", err)
+		}
+		policies = append(policies, policy)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate communities for moderator: %w", err)
+	}
+	return policies, nil
+}
+
+// SetCommunityModerator records the administrator who added the bot to a community.
+func (s *Store) SetCommunityModerator(
+	ctx context.Context,
+	tenantID string,
+	chatID, moderatorChatID int64,
+) error {
+	if tenantID == "" || chatID == 0 || moderatorChatID <= 0 {
+		return fmt.Errorf("valid tenant, chat, and moderator are required")
+	}
+	command, err := s.pool.Exec(ctx, `
+		INSERT INTO community_policies (
+			tenant_id, chat_id, protection_level, automatic_actions_enabled, autoban_enabled, moderator_chat_id, admin_sender_chat_id
+		)
+		VALUES ($1, $2, 'STRICT', TRUE, TRUE, $3, $2)
+		ON CONFLICT (tenant_id, chat_id) DO UPDATE
+		SET moderator_chat_id = EXCLUDED.moderator_chat_id,
+			updated_at = now()
+	`, tenantID, chatID, moderatorChatID)
+	if err != nil {
+		return fmt.Errorf("set community moderator: %w", err)
+	}
+	if command.RowsAffected() != 1 {
+		return fmt.Errorf("set community moderator: no row changed")
+	}
+	return nil
+}
+
+func (s *Store) SetCommunityModeratorSenderChat(
+	ctx context.Context, tenantID string, chatID, moderatorChatID, senderChatID int64,
+) error {
+	if tenantID == "" || chatID == 0 || moderatorChatID <= 0 || senderChatID == 0 {
+		return fmt.Errorf("valid tenant, chat, moderator, and sender chat are required")
+	}
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO community_policies (
+			tenant_id, chat_id, protection_level, automatic_actions_enabled, autoban_enabled, moderator_chat_id, admin_sender_chat_id
+		) VALUES ($1, $2, 'STRICT', TRUE, TRUE, $3, $4)
+		ON CONFLICT (tenant_id, chat_id) DO UPDATE
+		SET moderator_chat_id = EXCLUDED.moderator_chat_id,
+			admin_sender_chat_id = EXCLUDED.admin_sender_chat_id,
+			updated_at = now()
+	`, tenantID, chatID, moderatorChatID, senderChatID)
+	if err != nil {
+		return fmt.Errorf("set community moderator sender chat: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) IsAuthorizedSenderChat(ctx context.Context, tenantID string, chatID, senderChatID int64) (bool, error) {
+	if tenantID == "" || chatID == 0 || senderChatID == 0 {
+		return false, fmt.Errorf("valid tenant, chat, and sender chat are required")
+	}
+	var allowed bool
+	err := s.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM community_policies
+			WHERE tenant_id = $1 AND chat_id = $2 AND admin_sender_chat_id = $3
+		)
+	`, tenantID, chatID, senderChatID).Scan(&allowed)
+	if err != nil {
+		return false, fmt.Errorf("check authorized sender chat: %w", err)
+	}
+	return allowed, nil
 }
 
 func validateCommunityPolicyLookup(tenantID string, chatID, userID int64) error {
@@ -552,6 +677,7 @@ func (s *Store) RecordTerminal(
 		if action.IdempotencyKey == "" {
 			return fmt.Errorf("insert moderation action for event %q: idempotency key is required", event.SourceKey)
 		}
+		notification := normalizeDeletionNotification(action.Notification)
 		_, err = tx.Exec(ctx, `
 			INSERT INTO moderation_actions (
 				decision_id,
@@ -559,12 +685,18 @@ func (s *Store) RecordTerminal(
 				tenant_id,
 				idempotency_key,
 				action_type,
-				chat_id,
-				user_id,
-				message_id,
-				until_date
-			)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULLIF($9, 0))
+			chat_id,
+			user_id,
+			message_id,
+			until_date,
+			notification_chat_id,
+			notification_author_username,
+			notification_author_user_id,
+			notification_message,
+			notification_reasons,
+			notification_risk_score
+		)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULLIF($9, 0), $10, $11, $12, $13, $14, $15)
 			ON CONFLICT DO NOTHING
 		`,
 			decisionID,
@@ -576,6 +708,12 @@ func (s *Store) RecordTerminal(
 			action.Target.UserID,
 			action.Target.MessageID,
 			action.UntilDate,
+			notification.ChatID,
+			notification.AuthorUsername,
+			notification.AuthorUserID,
+			notification.Message,
+			notification.Reasons,
+			notification.RiskScore,
 		)
 		if err != nil {
 			return fmt.Errorf("insert moderation action for event %q: %w", event.SourceKey, err)
@@ -616,4 +754,11 @@ func normalizeInputFeatures(input moderation.InputFeatures) moderation.InputFeat
 		input.MediaTypes = []string{}
 	}
 	return input
+}
+
+func normalizeDeletionNotification(notification moderation.DeletionNotification) moderation.DeletionNotification {
+	if notification.Reasons == nil {
+		notification.Reasons = []string{}
+	}
+	return notification
 }

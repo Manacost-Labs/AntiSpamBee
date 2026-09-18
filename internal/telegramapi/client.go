@@ -409,7 +409,7 @@ func (c *Client) SetWebhook(ctx context.Context, webhookURL, secret string) erro
 		URL: webhookURL, SecretToken: secret,
 		AllowedUpdates: []string{
 			"message", "edited_message", "channel_post", "edited_channel_post",
-			"callback_query", "message_reaction",
+			"callback_query", "message_reaction", "my_chat_member",
 		},
 	}, &configured); err != nil {
 		return fmt.Errorf("set Telegram webhook: %w", err)
@@ -499,6 +499,20 @@ func (c *Client) GetChatMemberStatus(ctx context.Context, chatID, userID int64) 
 		return "", fmt.Errorf("get Telegram chat member: empty status")
 	}
 	return member.Status, nil
+}
+
+// GetChatTitle returns the title of a group or channel visible to the bot.
+func (c *Client) GetChatTitle(ctx context.Context, chatID int64) (string, error) {
+	if chatID == 0 {
+		return "", fmt.Errorf("Telegram chat ID must not be zero")
+	}
+	var result chat
+	if err := c.call(ctx, "getChat", struct {
+		ChatID int64 `json:"chat_id"`
+	}{ChatID: chatID}, &result); err != nil {
+		return "", fmt.Errorf("get Telegram chat: %w", err)
+	}
+	return strings.TrimSpace(result.Title), nil
 }
 
 func (c *Client) call(ctx context.Context, method string, payload, result any) error {

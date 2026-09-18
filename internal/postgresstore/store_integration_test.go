@@ -73,6 +73,12 @@ func TestStoreRecordTerminalIsIdempotent(t *testing.T) {
 				Kind: moderation.TargetMessage, ChatID: -100777, UserID: 42, MessageID: 91,
 			},
 			IdempotencyKey: "delete-message:-100777:91:82373d0f-5740-5f07-b4e8-02c2f4edd824",
+			Notification: moderation.DeletionNotification{
+				ChatID: 9001, AuthorUsername: "spam_account", AuthorUserID: 42,
+				Message:   "Подключай VPN со скидкой",
+				Reasons:   []string{detection.ReasonCommercialPromotion, detection.ReasonVPNPromotion},
+				RiskScore: 0.95,
+			},
 		}},
 		Signals: []detection.Signal{
 			{
@@ -222,6 +228,10 @@ func TestStoreRecordTerminalIsIdempotent(t *testing.T) {
 	if claimed.Type != moderation.ActionDeleteMessage || claimed.AttemptCount != 1 {
 		t.Fatalf("claimed action = %#v", claimed)
 	}
+	if claimed.Notification.ChatID != 9001 || claimed.Notification.AuthorUsername != "spam_account" ||
+		claimed.Notification.Message != "Подключай VPN со скидкой" || len(claimed.Notification.Reasons) != 2 {
+		t.Fatalf("claimed notification = %#v", claimed.Notification)
+	}
 	if _, found, err := store.ClaimAction(ctx, "worker-2", 30*time.Second); err != nil || found {
 		t.Fatalf("second ClaimAction() found/error = %v/%v, want leased action hidden", found, err)
 	}
@@ -246,6 +256,13 @@ func TestStoreRecordTerminalIsIdempotent(t *testing.T) {
 	}
 	if actionStatus != "SUCCEEDED" || finalEventState != string(moderation.ProcessedAction) {
 		t.Fatalf("action/event status = %q/%q", actionStatus, finalEventState)
+	}
+	var notificationMessage string
+	if err := pool.QueryRow(ctx, `SELECT notification_message FROM moderation_actions WHERE event_id = $1`, event.EventID).Scan(&notificationMessage); err != nil {
+		t.Fatalf("query cleared notification: %v", err)
+	}
+	if notificationMessage != "" {
+		t.Fatalf("notification message remains after action completion: %q", notificationMessage)
 	}
 	if err := store.RecordTerminal(ctx, event, outcome); err != nil {
 		t.Fatalf("record event replay after completed action: %v", err)
@@ -337,6 +354,9 @@ func TestStorePersistsCommunityPolicyAllowlistAndReportIdempotently(t *testing.T
 	if err := store.SetCommunityProtection(ctx, tenantID, -1001, "OBSERVE"); err != nil {
 		t.Fatal(err)
 	}
+	if err := store.SetCommunityModerator(ctx, tenantID, -1001, 7); err != nil {
+		t.Fatal(err)
+	}
 	if err := store.SetAllowlisted(ctx, tenantID, -1001, 42, 1, true); err != nil {
 		t.Fatal(err)
 	}
@@ -344,7 +364,7 @@ func TestStorePersistsCommunityPolicyAllowlistAndReportIdempotently(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if policy.ProtectionLevel != "OBSERVE" || policy.AutomaticActionsEnabled || policy.AutobanEnabled || !policy.IsAllowlisted {
+	if policy.ProtectionLevel != "OBSERVE" || policy.AutomaticActionsEnabled || policy.AutobanEnabled || !policy.IsAllowlisted || policy.ModeratorChatID != 7 {
 		t.Fatalf("policy = %#v", policy)
 	}
 	senderChatPolicy, err := store.GetCommunityPolicy(ctx, tenantID, -1001, 0)

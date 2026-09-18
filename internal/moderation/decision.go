@@ -58,6 +58,18 @@ type ClaimedAction struct {
 	Target       ActionTarget
 	AttemptCount int
 	UntilDate    int64
+	Notification DeletionNotification
+}
+
+// DeletionNotification is the short-lived context sent to the community
+// administrator after an automatic message deletion succeeds.
+type DeletionNotification struct {
+	ChatID         int64
+	AuthorUsername string
+	AuthorUserID   int64
+	Message        string
+	Reasons        []string
+	RiskScore      float64
 }
 
 // DecisionInput is the complete, already-enriched input to the decision engine.

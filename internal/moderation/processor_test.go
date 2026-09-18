@@ -16,6 +16,15 @@ type recordingStore struct {
 	err     error
 }
 
+type communityPolicyStub struct {
+	policy CommunityPolicy
+	err    error
+}
+
+func (s *communityPolicyStub) GetCommunityPolicy(context.Context, string, int64, int64) (CommunityPolicy, error) {
+	return s.policy, s.err
+}
+
 func hasAction(outcome Outcome, actionType ActionType) bool {
 	for _, action := range outcome.Actions {
 		if action.Type == actionType {
@@ -325,6 +334,52 @@ func TestProcessorQueuesMessageDeletionAtHighRisk(t *testing.T) {
 	}
 }
 
+func TestProcessorCapturesDeletedMessageNotificationForCommunityAdmin(t *testing.T) {
+	store := &recordingStore{}
+	processor, err := NewProcessor(
+		store,
+		&profileFetcherStub{},
+		detection.NewProfileDetector(),
+		WithPolicyStore(&communityPolicyStub{policy: CommunityPolicy{
+			ProtectionLevel:         "STRICT",
+			AutomaticActionsEnabled: true,
+			AutobanEnabled:          true,
+			ModeratorChatID:         9001,
+		}}),
+	)
+	if err != nil {
+		t.Fatalf("NewProcessor() error = %v", err)
+	}
+
+	err = processor.Process(context.Background(), telegramEvent(`{
+		"message": {
+			"message_id": 91,
+			"from": {"id": 42, "username": "spam_account"},
+			"chat": {"id": -100777, "type": "supergroup"},
+			"text": "Казино: бонус 500% за депозит. Забрать по ссылке",
+			"entities": [{"type": "text_link", "offset": 0, "length": 6, "url": "https://example.test"}]
+		}
+	}`))
+	if err != nil {
+		t.Fatalf("Process() error = %v", err)
+	}
+
+	var deletion ActionRequest
+	for _, action := range store.outcome.Actions {
+		if action.Type == ActionDeleteMessage {
+			deletion = action
+			break
+		}
+	}
+	if deletion.Notification.ChatID != 9001 || deletion.Notification.AuthorUsername != "spam_account" ||
+		deletion.Notification.Message != "Казино: бонус 500% за депозит. Забрать по ссылке" {
+		t.Fatalf("notification = %#v", deletion.Notification)
+	}
+	if len(deletion.Notification.Reasons) == 0 || deletion.Notification.RiskScore < 0.9 {
+		t.Fatalf("notification reasons/risk = %#v", deletion.Notification)
+	}
+}
+
 func TestProcessorQueuesCompactJobPromotionDeletion(t *testing.T) {
 	store := &recordingStore{}
 	fetcher := &profileFetcherStub{profile: detection.Profile{Username: "spammer"}}
@@ -406,6 +461,33 @@ func TestProcessorDeletesAdvertisingMessageSentAsChannel(t *testing.T) {
 	}
 	if fetcher.calls != 0 {
 		t.Fatalf("profile fetch calls = %d, want 0 for sender_chat", fetcher.calls)
+	}
+}
+
+func TestProcessorKeepsAnonymousAdminMessageForReview(t *testing.T) {
+	store := &recordingStore{}
+	fetcher := &profileFetcherStub{}
+	processor, err := NewProcessor(store, fetcher, detection.NewProfileDetector())
+	if err != nil {
+		t.Fatalf("NewProcessor() error = %v", err)
+	}
+	event := telegramEvent(`{
+		"message": {
+			"message_id": 95,
+			"sender_chat": {"id": -100777, "type": "supergroup"},
+			"chat": {"id": -100777, "type": "supergroup"},
+			"text": "VPN с которым летают все соц сети только у нас vpn.ru"
+		}
+	}`)
+
+	if err := processor.Process(context.Background(), event); err != nil {
+		t.Fatalf("Process() error = %v", err)
+	}
+	if store.outcome.State != ProcessedReview || len(store.outcome.Actions) != 0 {
+		t.Fatalf("outcome = %#v, want protected REVIEW", store.outcome)
+	}
+	if fetcher.calls != 0 {
+		t.Fatalf("profile fetch calls = %d, want 0 for anonymous admin", fetcher.calls)
 	}
 }
 

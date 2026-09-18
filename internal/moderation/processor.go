@@ -55,6 +55,7 @@ type ActionRequest struct {
 	Target         ActionTarget
 	IdempotencyKey string
 	UntilDate      int64
+	Notification   DeletionNotification
 }
 
 type terminalRecorder interface {
@@ -241,18 +242,20 @@ func (p *Processor) Process(ctx context.Context, event events.TelegramUpdate) er
 	if profileFetchErr != nil && preliminary.RiskScore < 0.90 && isRetryableProfileError(profileFetchErr) {
 		return fmt.Errorf("fetch Telegram profile for moderation: %w", profileFetchErr)
 	}
-	isProtected := false
+	isProtected := target.isAnonymousAdmin()
 	automaticActionsDisabled := false
 	autobanDisabled := false
+	moderatorChatID := int64(0)
 	if isAutomaticAction(preliminary.AuthorizedAction) {
 		if p.policyStore != nil {
 			policy, err := p.policyStore.GetCommunityPolicy(ctx, event.TenantID, target.ChatID, target.UserID)
 			if err != nil {
 				return fmt.Errorf("load community moderation policy: %w", err)
 			}
-			isProtected = policy.IsAllowlisted
+			isProtected = isProtected || policy.IsAllowlisted
 			automaticActionsDisabled = !policy.AutomaticActionsEnabled || policy.ProtectionLevel == "OBSERVE"
 			autobanDisabled = !policy.AutobanEnabled
+			moderatorChatID = policy.ModeratorChatID
 		}
 		if !isProtected && target.UserID > 0 {
 			status, err := p.profiles.GetChatMemberStatus(ctx, target.ChatID, target.UserID)
@@ -277,7 +280,12 @@ func (p *Processor) Process(ctx context.Context, event events.TelegramUpdate) er
 	state := terminalStateFor(decision.AuthorizedAction)
 	actions := []ActionRequest{}
 	if isAutomaticAction(decision.AuthorizedAction) {
-		actions = actionRequestsFor(event.EventID, decision.AuthorizedAction, actionTarget)
+		actions = actionRequestsFor(
+			event.EventID,
+			decision.AuthorizedAction,
+			actionTarget,
+			deletionNotification(event.Payload, message, signals, decision, actionTarget.UserID, moderatorChatID),
+		)
 	}
 
 	if err := p.store.RecordTerminal(ctx, event, Outcome{
@@ -447,11 +455,19 @@ func isRetryableProfileError(err error) bool {
 	return errors.As(err, &networkErr) && (networkErr.Timeout() || networkErr.Temporary())
 }
 
-func actionRequestsFor(eventID string, action ActionType, target ActionTarget) []ActionRequest {
+func actionRequestsFor(eventID string, action ActionType, target ActionTarget, notifications ...DeletionNotification) []ActionRequest {
 	requests := []ActionRequest{}
+	var notification DeletionNotification
+	if len(notifications) > 0 {
+		notification = notifications[0]
+	}
 	appendAction := func(actionType ActionType) {
+		requestNotification := DeletionNotification{}
+		if actionType == ActionDeleteMessage {
+			requestNotification = notification
+		}
 		requests = append(requests, ActionRequest{
-			Type: actionType, Target: target,
+			Type: actionType, Target: target, Notification: requestNotification,
 			IdempotencyKey: actionIdempotencyKey(eventID, actionType, target),
 		})
 	}
@@ -465,6 +481,84 @@ func actionRequestsFor(eventID string, action ActionType, target ActionTarget) [
 	}
 	appendAction(action)
 	return requests
+}
+
+func deletionNotification(
+	payload json.RawMessage,
+	content detection.MessageContent,
+	signals []detection.Signal,
+	decision Decision,
+	authorUserID, moderatorChatID int64,
+) DeletionNotification {
+	if moderatorChatID == 0 {
+		return DeletionNotification{}
+	}
+	message := strings.TrimSpace(strings.Join([]string{content.Text, content.Caption}, "\n"))
+	if message == "" && strings.TrimSpace(content.OCRText) != "" {
+		message = "[Текст с изображения]\n" + strings.TrimSpace(content.OCRText)
+	}
+	if message == "" {
+		message = "[Медиа без текстовой подписи]"
+	}
+	return DeletionNotification{
+		ChatID:         moderatorChatID,
+		AuthorUsername: messageAuthorUsername(payload),
+		AuthorUserID:   authorUserID,
+		Message:        message,
+		Reasons:        deletionReasons(signals),
+		RiskScore:      decision.RiskScore,
+	}
+}
+
+func deletionReasons(signals []detection.Signal) []string {
+	reasons := []string{}
+	for _, signal := range signals {
+		if signal.Status != detection.StatusAvailable || signal.Score == nil || *signal.Score < 0.90 {
+			continue
+		}
+		for _, reason := range signal.ReasonCodes {
+			reasons = appendUniqueReason(reasons, reason)
+		}
+	}
+	return reasons
+}
+
+func appendUniqueReason(reasons []string, reason string) []string {
+	for _, existing := range reasons {
+		if existing == reason {
+			return reasons
+		}
+	}
+	return append(reasons, reason)
+}
+
+func messageAuthorUsername(payload json.RawMessage) string {
+	type sender struct {
+		Username string `json:"username"`
+	}
+	type message struct {
+		From *sender `json:"from"`
+	}
+	var update struct {
+		Message               *message `json:"message"`
+		EditedMessage         *message `json:"edited_message"`
+		BusinessMessage       *message `json:"business_message"`
+		EditedBusinessMessage *message `json:"edited_business_message"`
+		ChannelPost           *message `json:"channel_post"`
+		EditedChannelPost     *message `json:"edited_channel_post"`
+	}
+	if json.Unmarshal(payload, &update) != nil {
+		return ""
+	}
+	for _, candidate := range []*message{
+		update.Message, update.EditedMessage, update.BusinessMessage,
+		update.EditedBusinessMessage, update.ChannelPost, update.EditedChannelPost,
+	} {
+		if candidate != nil && candidate.From != nil {
+			return candidate.From.Username
+		}
+	}
+	return ""
 }
 
 func terminalStateFor(action ActionType) TerminalState {
@@ -573,11 +667,16 @@ func appendUniqueURL(values []string, value string) []string {
 }
 
 type moderationTarget struct {
-	ChatID    int64
-	UserID    int64
-	MessageID int64
-	ChatType  string
-	Kind      TargetKind
+	ChatID       int64
+	UserID       int64
+	MessageID    int64
+	ChatType     string
+	SenderChatID int64
+	Kind         TargetKind
+}
+
+func (t moderationTarget) isAnonymousAdmin() bool {
+	return t.SenderChatID != 0 && t.SenderChatID == t.ChatID
 }
 
 func (t moderationTarget) actionTarget() ActionTarget {
@@ -602,9 +701,10 @@ func moderationTargetFrom(payload json.RawMessage) moderationTarget {
 		Type string `json:"type"`
 	}
 	type message struct {
-		MessageID int64   `json:"message_id"`
-		From      *sender `json:"from"`
-		Chat      *chat   `json:"chat"`
+		MessageID  int64   `json:"message_id"`
+		From       *sender `json:"from"`
+		Chat       *chat   `json:"chat"`
+		SenderChat *chat   `json:"sender_chat"`
 	}
 	var update struct {
 		Message               *message `json:"message"`
@@ -627,7 +727,7 @@ func moderationTargetFrom(payload json.RawMessage) moderationTarget {
 	if json.Unmarshal(payload, &update) != nil {
 		return moderationTarget{}
 	}
-	targetFrom := func(chatValue *chat, senderValue *sender, messageID int64, kind TargetKind) moderationTarget {
+	targetFrom := func(chatValue *chat, senderValue *sender, senderChat *chat, messageID int64, kind TargetKind) moderationTarget {
 		target := moderationTarget{MessageID: messageID, Kind: kind}
 		if senderValue != nil {
 			target.UserID = senderValue.ID
@@ -635,6 +735,9 @@ func moderationTargetFrom(payload json.RawMessage) moderationTarget {
 		if chatValue != nil {
 			target.ChatID = chatValue.ID
 			target.ChatType = chatValue.Type
+		}
+		if senderChat != nil {
+			target.SenderChatID = senderChat.ID
 		}
 		return target
 	}
@@ -647,7 +750,7 @@ func moderationTargetFrom(payload json.RawMessage) moderationTarget {
 		update.EditedChannelPost,
 	} {
 		if candidate != nil {
-			return targetFrom(candidate.Chat, candidate.From, candidate.MessageID, TargetMessage)
+			return targetFrom(candidate.Chat, candidate.From, candidate.SenderChat, candidate.MessageID, TargetMessage)
 		}
 	}
 	if update.CallbackQuery != nil && update.CallbackQuery.From != nil && update.CallbackQuery.From.ID > 0 {
@@ -659,10 +762,10 @@ func moderationTargetFrom(payload json.RawMessage) moderationTarget {
 		if update.CallbackQuery.Message != nil {
 			messageID = update.CallbackQuery.Message.MessageID
 		}
-		return targetFrom(callbackChat, update.CallbackQuery.From, messageID, TargetMessage)
+		return targetFrom(callbackChat, update.CallbackQuery.From, nil, messageID, TargetMessage)
 	}
 	if update.MessageReaction != nil && len(update.MessageReaction.NewReaction) > 0 && update.MessageReaction.User != nil && update.MessageReaction.User.ID > 0 {
-		return targetFrom(update.MessageReaction.Chat, update.MessageReaction.User, update.MessageReaction.MessageID, TargetReaction)
+		return targetFrom(update.MessageReaction.Chat, update.MessageReaction.User, nil, update.MessageReaction.MessageID, TargetReaction)
 	}
 	return moderationTarget{}
 }

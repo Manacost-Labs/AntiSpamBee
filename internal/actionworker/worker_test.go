@@ -52,6 +52,7 @@ type telegramStub struct {
 	mutes             int
 	unbans            int
 	messages          []string
+	messageChats      []int64
 	sendMessageErr    error
 }
 
@@ -78,7 +79,8 @@ func (t *telegramStub) UnbanChatMember(context.Context, int64, int64) error {
 	t.unbans++
 	return nil
 }
-func (t *telegramStub) SendMessage(_ context.Context, _ int64, message string) error {
+func (t *telegramStub) SendMessage(_ context.Context, chatID int64, message string) error {
+	t.messageChats = append(t.messageChats, chatID)
 	t.messages = append(t.messages, message)
 	return t.sendMessageErr
 }
@@ -94,6 +96,50 @@ func TestWorkerExecutesDeleteReaction(t *testing.T) {
 	}
 	if telegram.reactionDeletes != 1 || !repo.succeeded {
 		t.Fatalf("reaction deletes = %d, succeeded = %v", telegram.reactionDeletes, repo.succeeded)
+	}
+}
+
+func TestWorkerNotifiesResponsibleAdminAfterSuccessfulMessageDeletion(t *testing.T) {
+	action := claimedAction(moderation.ActionDeleteMessage, 1)
+	action.Notification = moderation.DeletionNotification{
+		ChatID:         9001,
+		AuthorUsername: "spam_account",
+		AuthorUserID:   42,
+		Message:        "Подключай VPN со скидкой",
+		Reasons:        []string{"COMMERCIAL_PROMOTION", "VPN_PROMOTION"},
+		RiskScore:      0.95,
+	}
+	repo := &repositoryStub{found: true, action: action}
+	telegram := &telegramStub{}
+	worker := newTestWorker(t, repo, telegram)
+
+	worked, err := worker.RunOnce(context.Background())
+	if err != nil || !worked || !repo.succeeded {
+		t.Fatalf("worked/error/succeeded = %v/%v/%v", worked, err, repo.succeeded)
+	}
+	if len(telegram.messages) != 1 || len(telegram.messageChats) != 1 || telegram.messageChats[0] != 9001 {
+		t.Fatalf("notifications = %#v to %#v", telegram.messages, telegram.messageChats)
+	}
+	for _, wanted := range []string{"@spam_account", "Подключай VPN со скидкой", "коммерческая реклама", "реклама VPN"} {
+		if !strings.Contains(telegram.messages[0], wanted) {
+			t.Fatalf("notification %q does not contain %q", telegram.messages[0], wanted)
+		}
+	}
+}
+
+func TestWorkerDoesNotNotifyAdminWhenMessageDeletionFails(t *testing.T) {
+	action := claimedAction(moderation.ActionDeleteMessage, 1)
+	action.Notification = moderation.DeletionNotification{ChatID: 9001, Message: "Спам"}
+	repo := &repositoryStub{found: true, action: action}
+	telegram := &telegramStub{deleteMessageErr: &telegramapi.APIError{ErrorCode: 403, Description: "Forbidden"}}
+	worker := newTestWorker(t, repo, telegram)
+
+	_, err := worker.RunOnce(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(telegram.messages) != 0 {
+		t.Fatalf("notifications = %q", telegram.messages)
 	}
 }
 

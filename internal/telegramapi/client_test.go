@@ -284,6 +284,27 @@ func TestClientGetChatMemberStatus(t *testing.T) {
 	}
 }
 
+func TestClientGetChatTitle(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/botsecret/getChat" {
+			t.Fatalf("path = %q", r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"ok":true,"result":{"id":-100123,"type":"supergroup","title":"Группа Рейд"}}`))
+	}))
+	defer server.Close()
+	client, err := NewClient(ClientConfig{Token: "secret", BaseURL: server.URL, HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	title, err := client.GetChatTitle(context.Background(), -100123)
+	if err != nil {
+		t.Fatalf("GetChatTitle() error = %v", err)
+	}
+	if title != "Группа Рейд" {
+		t.Fatalf("title = %q", title)
+	}
+}
+
 func TestClientRestrictChatMember(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/botsecret/restrictChatMember" {

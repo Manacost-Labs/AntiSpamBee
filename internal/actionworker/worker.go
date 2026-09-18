@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"antispambee/internal/moderation"
@@ -83,6 +84,9 @@ func (w *Worker) RunOnce(ctx context.Context) (bool, error) {
 		if err := w.repository.MarkActionSucceeded(ctx, action, assumed); err != nil {
 			return true, fmt.Errorf("mark moderation action succeeded: %w", err)
 		}
+		if action.Type == moderation.ActionDeleteMessage {
+			w.notifyDeletedMessage(ctx, action.Notification)
+		}
 		if action.Type == moderation.ActionBanUser {
 			message := fmt.Sprintf("⛔ Пользователь %d заблокирован модерацией AntiSpamBee.", action.Target.UserID)
 			if err := w.telegram.SendMessage(ctx, action.Target.ChatID, message); err != nil {
@@ -111,6 +115,76 @@ func (w *Worker) RunOnce(ctx context.Context) (bool, error) {
 		return true, fmt.Errorf("mark moderation action retryable: %w", err)
 	}
 	return true, nil
+}
+
+func (w *Worker) notifyDeletedMessage(ctx context.Context, notification moderation.DeletionNotification) {
+	message := formatDeletionNotification(notification)
+	if message == "" {
+		return
+	}
+	if err := w.telegram.SendMessage(ctx, notification.ChatID, message); err != nil {
+		slog.Warn("send deleted-message notification failed", "chat_id", notification.ChatID, "error", err)
+	}
+}
+
+func formatDeletionNotification(notification moderation.DeletionNotification) string {
+	message := strings.TrimSpace(notification.Message)
+	if notification.ChatID == 0 || message == "" {
+		return ""
+	}
+	author := fmt.Sprintf("ID %d", notification.AuthorUserID)
+	if username := strings.TrimPrefix(strings.TrimSpace(notification.AuthorUsername), "@"); username != "" {
+		author = "@" + username
+	}
+	reasons := make([]string, 0, len(notification.Reasons))
+	for _, reason := range notification.Reasons {
+		reasons = append(reasons, deletionReasonLabel(reason))
+	}
+	if len(reasons) == 0 {
+		reasons = append(reasons, "подозрительная реклама или спам")
+	}
+	return fmt.Sprintf(
+		"🗑 Удалено сообщение\nАвтор: %s\nПричина: %s\nРиск: %.2f\n\nТекст:\n%s",
+		author,
+		strings.Join(reasons, ", "),
+		notification.RiskScore,
+		truncateRunes(message, 3000),
+	)
+}
+
+func deletionReasonLabel(reason string) string {
+	switch reason {
+	case "COMMERCIAL_PROMOTION":
+		return "коммерческая реклама"
+	case "VPN_PROMOTION":
+		return "реклама VPN"
+	case "GAMBLING_PROMOTION":
+		return "реклама азартных игр"
+	case "CRYPTO_INVESTMENT_PROMOTION":
+		return "крипто-инвестиционная реклама"
+	case "LOAN_PROMOTION":
+		return "реклама займов"
+	case "MASS_JOB_OFFER":
+		return "массовая вакансия"
+	case "ADULT_CONTENT":
+		return "контент 18+"
+	case "DUPLICATE_SPAM":
+		return "повторяющийся спам"
+	case "MESSAGE_FLOOD":
+		return "флуд"
+	case "PRIOR_MODERATION_VIOLATIONS":
+		return "повторные нарушения"
+	default:
+		return reason
+	}
+}
+
+func truncateRunes(value string, limit int) string {
+	runes := []rune(value)
+	if len(runes) <= limit {
+		return value
+	}
+	return string(runes[:limit]) + "…"
 }
 
 func (w *Worker) execute(ctx context.Context, action moderation.ClaimedAction) (bool, error) {

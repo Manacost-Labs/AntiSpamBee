@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"strings"
 	"time"
@@ -18,12 +19,17 @@ type commandStore interface {
 	terminalRecorder
 	RecordUserReport(context.Context, string, int64, int64, int64, int64) error
 	SetCommunityProtection(context.Context, string, int64, string) error
+	SetCommunityModerator(context.Context, string, int64, int64) error
+	SetCommunityModeratorSenderChat(context.Context, string, int64, int64, int64) error
+	IsAuthorizedSenderChat(context.Context, string, int64, int64) (bool, error)
 	SetAllowlisted(context.Context, string, int64, int64, int64, bool) error
 	GetCommunityPolicy(context.Context, string, int64, int64) (CommunityPolicy, error)
+	ListCommunityPoliciesForModerator(context.Context, string, int64) ([]CommunityPolicy, error)
 }
 
 type commandTelegram interface {
 	GetChatMemberStatus(context.Context, int64, int64) (string, error)
+	GetChatTitle(context.Context, int64) (string, error)
 	SendMessage(context.Context, int64, string) error
 	SendMessageWithURLButton(context.Context, int64, string, string, string) error
 }
@@ -64,6 +70,9 @@ func NewCommandRouter(
 }
 
 func (r *CommandRouter) Process(ctx context.Context, event events.TelegramUpdate) error {
+	if chatID, adminID, ok := botAddedToCommunity(event.Payload); ok {
+		return r.store.SetCommunityModerator(ctx, event.TenantID, chatID, adminID)
+	}
 	command, ok := parseCommand(event.Payload)
 	if !ok {
 		return r.fallback.Process(ctx, event)
@@ -97,7 +106,10 @@ func (r *CommandRouter) Process(ctx context.Context, event events.TelegramUpdate
 		}
 		return nil
 	case "status":
-		if ok, err := r.requireAdmin(ctx, command); err != nil {
+		if command.ChatType == "private" {
+			return r.handlePersonalStatus(ctx, event, command)
+		}
+		if ok, err := r.requireAdmin(ctx, event.TenantID, command); err != nil {
 			return err
 		} else if !ok {
 			return r.respondToInvalidCommand(ctx, event, command.ChatID, "Эта команда доступна только администраторам.")
@@ -113,6 +125,8 @@ func (r *CommandRouter) Process(ctx context.Context, event events.TelegramUpdate
 			"AntiSpamBee: уровень %s, автоматические действия: %t, автобан: %t",
 			policy.ProtectionLevel, policy.AutomaticActionsEnabled, policy.AutobanEnabled,
 		))
+	case "link":
+		return r.handleLink(ctx, event, command)
 	case "protection":
 		return r.handleProtection(ctx, event, command)
 	case "allow", "unallow":
@@ -124,12 +138,118 @@ func (r *CommandRouter) Process(ctx context.Context, event events.TelegramUpdate
 	}
 }
 
+func (r *CommandRouter) handleLink(ctx context.Context, event events.TelegramUpdate, command parsedCommand) error {
+	if command.ChatType == "private" {
+		parts := strings.Split(command.Argument, ":")
+		chatID, err := strconv.ParseInt(parts[0], 10, 64)
+		senderChatID := int64(0)
+		if len(parts) == 2 {
+			senderChatID, err = strconv.ParseInt(parts[1], 10, 64)
+		}
+		if err != nil || len(parts) != 2 || chatID == 0 || senderChatID == 0 || command.SenderID <= 0 {
+			return r.respondToInvalidCommand(ctx, event, command.ChatID, "Использование: /link CHAT_ID:SENDER_CHAT_ID. Сначала отправьте /link от имени нужной группы.")
+		}
+		status, err := r.telegram.GetChatMemberStatus(ctx, chatID, command.SenderID)
+		if err != nil {
+			return r.respondToInvalidCommand(ctx, event, command.ChatID, "Не удалось проверить ваши права в этой группе. Убедитесь, что бот — администратор группы.")
+		}
+		if status != "administrator" && status != "creator" {
+			return r.respondToInvalidCommand(ctx, event, command.ChatID, "Ваш личный аккаунт должен быть администратором этой группы.")
+		}
+		if err := r.store.SetCommunityModeratorSenderChat(ctx, event.TenantID, chatID, command.SenderID, senderChatID); err != nil {
+			return err
+		}
+		if err := r.recordCommand(ctx, event, nil); err != nil {
+			return err
+		}
+		title, err := r.telegram.GetChatTitle(ctx, chatID)
+		if err != nil || strings.TrimSpace(title) == "" {
+			title = fmt.Sprintf("Группа %d", chatID)
+		}
+		return r.telegram.SendMessage(ctx, command.ChatID, "Группа привязана: "+title)
+	}
+	if (command.ChatType != "group" && command.ChatType != "supergroup") || !command.SentAsChat {
+		return r.respondToInvalidCommand(ctx, event, command.ChatID, "Эту команду отправьте от имени группы.")
+	}
+	if err := r.recordCommand(ctx, event, nil); err != nil {
+		return err
+	}
+	return r.telegram.SendMessage(ctx, command.ChatID, fmt.Sprintf(
+		"Чтобы привязать эту группу к личному кабинету, отправьте боту в ЛС: /link %d:%d",
+		command.ChatID, command.SenderChatID,
+	))
+}
+
+func (r *CommandRouter) handlePersonalStatus(ctx context.Context, event events.TelegramUpdate, command parsedCommand) error {
+	if command.SenderID <= 0 {
+		return r.respondToInvalidCommand(ctx, event, command.ChatID, "Не удалось определить ваш аккаунт Telegram.")
+	}
+	policies, err := r.store.ListCommunityPoliciesForModerator(ctx, event.TenantID, command.SenderID)
+	if err != nil {
+		return err
+	}
+	if err := r.recordCommand(ctx, event, nil); err != nil {
+		return err
+	}
+	if len(policies) == 0 {
+		return r.telegram.SendMessage(ctx, command.ChatID, "У вас пока нет подключённых групп. Добавьте бота в группу как администратор.")
+	}
+	lines := []string{"Ваши группы:"}
+	for _, policy := range policies {
+		title, err := r.telegram.GetChatTitle(ctx, policy.ChatID)
+		if err != nil || strings.TrimSpace(title) == "" {
+			title = fmt.Sprintf("Группа %d", policy.ChatID)
+		}
+		lines = append(lines, fmt.Sprintf(
+			"%s: уровень %s, автоматические действия: %t, автобан: %t",
+			title, policy.ProtectionLevel, policy.AutomaticActionsEnabled, policy.AutobanEnabled,
+		))
+	}
+	return r.telegram.SendMessage(ctx, command.ChatID, strings.Join(lines, "\n"))
+}
+
+func botAddedToCommunity(payload json.RawMessage) (int64, int64, bool) {
+	type user struct {
+		ID int64 `json:"id"`
+	}
+	type member struct {
+		Status string `json:"status"`
+	}
+	var update struct {
+		MyChatMember *struct {
+			From *user `json:"from"`
+			Chat *struct {
+				ID   int64  `json:"id"`
+				Type string `json:"type"`
+			} `json:"chat"`
+			OldChatMember *member `json:"old_chat_member"`
+			NewChatMember *member `json:"new_chat_member"`
+		} `json:"my_chat_member"`
+	}
+	if json.Unmarshal(payload, &update) != nil || update.MyChatMember == nil ||
+		update.MyChatMember.From == nil || update.MyChatMember.Chat == nil ||
+		update.MyChatMember.OldChatMember == nil || update.MyChatMember.NewChatMember == nil {
+		return 0, 0, false
+	}
+	change := update.MyChatMember
+	if change.From.ID <= 0 || change.Chat.ID == 0 ||
+		(change.Chat.Type != "group" && change.Chat.Type != "supergroup" && change.Chat.Type != "channel") ||
+		(change.OldChatMember.Status != "left" && change.OldChatMember.Status != "kicked") ||
+		(change.NewChatMember.Status != "member" && change.NewChatMember.Status != "administrator") {
+		return 0, 0, false
+	}
+	return change.Chat.ID, change.From.ID, true
+}
+
 type parsedCommand struct {
 	Name           string
 	Argument       string
 	ChatID         int64
 	ChatType       string
 	SenderID       int64
+	SenderChatID   int64
+	SenderChatType string
+	SentAsChat     bool
 	MessageID      int64
 	ReplyUserID    int64
 	ReplyMessageID int64
@@ -153,11 +273,19 @@ func parseCommand(payload json.RawMessage) (parsedCommand, bool) {
 			Text           string `json:"text"`
 			From           *user  `json:"from"`
 			Chat           *chat  `json:"chat"`
+			SenderChat     *chat  `json:"sender_chat"`
 			ReplyToMessage *reply `json:"reply_to_message"`
 		} `json:"message"`
 	}
-	if json.Unmarshal(payload, &update) != nil || update.Message == nil ||
-		update.Message.From == nil || update.Message.Chat == nil {
+	if json.Unmarshal(payload, &update) != nil || update.Message == nil || update.Message.Chat == nil {
+		return parsedCommand{}, false
+	}
+	// Telegram represents an anonymous administrator as sender_chat. Depending
+	// on the client and linked-discussion setup that identity may be the current
+	// group, another group, or its channel; all three are intentional group-side
+	// moderator commands.
+	sentAsChat := update.Message.SenderChat != nil && update.Message.SenderChat.ID != 0
+	if update.Message.From == nil && !sentAsChat {
 		return parsedCommand{}, false
 	}
 	fields := strings.Fields(strings.TrimSpace(update.Message.Text))
@@ -167,8 +295,14 @@ func parseCommand(payload json.RawMessage) (parsedCommand, bool) {
 	name := strings.TrimPrefix(strings.SplitN(fields[0], "@", 2)[0], "/")
 	command := parsedCommand{
 		Name: strings.ToLower(name), ChatID: update.Message.Chat.ID,
-		ChatType: update.Message.Chat.Type, SenderID: update.Message.From.ID,
-		MessageID: update.Message.MessageID,
+		ChatType: update.Message.Chat.Type, SentAsChat: sentAsChat, MessageID: update.Message.MessageID,
+	}
+	if update.Message.From != nil {
+		command.SenderID = update.Message.From.ID
+	}
+	if update.Message.SenderChat != nil {
+		command.SenderChatID = update.Message.SenderChat.ID
+		command.SenderChatType = update.Message.SenderChat.Type
 	}
 	if len(fields) > 1 {
 		command.Argument = strings.ToUpper(fields[1])
@@ -177,11 +311,18 @@ func parseCommand(payload json.RawMessage) (parsedCommand, bool) {
 		command.ReplyUserID = reply.From.ID
 		command.ReplyMessageID = reply.MessageID
 	}
+	slog.Info("moderator command received",
+		"command", command.Name,
+		"chat_type", command.ChatType,
+		"sent_as_chat", command.SentAsChat,
+		"sender_chat_id", command.SenderChatID,
+		"sender_chat_type", command.SenderChatType,
+	)
 	return command, true
 }
 
 func (r *CommandRouter) handleProtection(ctx context.Context, event events.TelegramUpdate, command parsedCommand) error {
-	if ok, err := r.requireAdmin(ctx, command); err != nil {
+	if ok, err := r.requireAdmin(ctx, event.TenantID, command); err != nil {
 		return err
 	} else if !ok {
 		return r.respondToInvalidCommand(ctx, event, command.ChatID, "Эта команда доступна только администраторам.")
@@ -193,6 +334,11 @@ func (r *CommandRouter) handleProtection(ctx context.Context, event events.Teleg
 	if err := r.store.SetCommunityProtection(ctx, event.TenantID, command.ChatID, command.Argument); err != nil {
 		return err
 	}
+	if command.SenderID > 0 {
+		if err := r.store.SetCommunityModerator(ctx, event.TenantID, command.ChatID, command.SenderID); err != nil {
+			return err
+		}
+	}
 	if err := r.recordCommand(ctx, event, nil); err != nil {
 		return err
 	}
@@ -200,7 +346,7 @@ func (r *CommandRouter) handleProtection(ctx context.Context, event events.Teleg
 }
 
 func (r *CommandRouter) handleAllowlist(ctx context.Context, event events.TelegramUpdate, command parsedCommand, allowed bool) error {
-	if ok, err := r.requireAdmin(ctx, command); err != nil {
+	if ok, err := r.requireAdmin(ctx, event.TenantID, command); err != nil {
 		return err
 	} else if !ok {
 		return r.respondToInvalidCommand(ctx, event, command.ChatID, "Эта команда доступна только администраторам.")
@@ -218,7 +364,7 @@ func (r *CommandRouter) handleAllowlist(ctx context.Context, event events.Telegr
 }
 
 func (r *CommandRouter) handleModeratorAction(ctx context.Context, event events.TelegramUpdate, command parsedCommand) error {
-	if ok, err := r.requireAdmin(ctx, command); err != nil {
+	if ok, err := r.requireAdmin(ctx, event.TenantID, command); err != nil {
 		return err
 	} else if !ok {
 		return r.respondToInvalidCommand(ctx, event, command.ChatID, "Эта команда доступна только администраторам.")
@@ -271,8 +417,14 @@ func (r *CommandRouter) handleModeratorAction(ctx context.Context, event events.
 	return r.telegram.SendMessage(ctx, command.ChatID, "Действие поставлено в безопасную очередь.")
 }
 
-func (r *CommandRouter) requireAdmin(ctx context.Context, command parsedCommand) (bool, error) {
+func (r *CommandRouter) requireAdmin(ctx context.Context, tenantID string, command parsedCommand) (bool, error) {
 	if command.ChatType != "group" && command.ChatType != "supergroup" {
+		return false, nil
+	}
+	if command.SentAsChat {
+		return r.store.IsAuthorizedSenderChat(ctx, tenantID, command.ChatID, command.SenderChatID)
+	}
+	if command.SenderID <= 0 {
 		return false, nil
 	}
 	status, err := r.telegram.GetChatMemberStatus(ctx, command.ChatID, command.SenderID)
@@ -332,6 +484,7 @@ func commandHelp() string {
 
 Для администраторов:
 /status — текущий режим защиты
+/link — привязать группу к личному кабинету
 /protection observe — только наблюдение
 /protection soft — ручная модерация
 /protection standard — удаление рекламы без автобана
