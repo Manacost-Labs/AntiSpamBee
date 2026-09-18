@@ -293,6 +293,61 @@ func TestClientSendMessage(t *testing.T) {
 	}
 }
 
+func TestClientGetBotUsername(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/botsecret/getMe" {
+			t.Fatalf("path = %q", r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"ok":true,"result":{"id":123,"is_bot":true,"first_name":"AntiSpamBee","username":"AntiSpamBeeBot"}}`))
+	}))
+	defer server.Close()
+	client, err := NewClient(ClientConfig{Token: "secret", BaseURL: server.URL, HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	username, err := client.GetBotUsername(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if username != "AntiSpamBeeBot" {
+		t.Fatalf("username = %q", username)
+	}
+}
+
+func TestClientSendMessageWithURLButton(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			ChatID      int64  `json:"chat_id"`
+			Text        string `json:"text"`
+			ReplyMarkup struct {
+				InlineKeyboard [][]struct {
+					Text string `json:"text"`
+					URL  string `json:"url"`
+				} `json:"inline_keyboard"`
+			} `json:"reply_markup"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		button := request.ReplyMarkup.InlineKeyboard[0][0]
+		if request.ChatID != 123 || request.Text != "Помощь" || button.Text != "Добавить в группу" || button.URL != "https://t.me/AntiSpamBeeBot?startgroup=setup&admin=delete_messages+restrict_members" {
+			t.Fatalf("request = %#v, button = %#v", request, button)
+		}
+		_, _ = w.Write([]byte(`{"ok":true,"result":{"message_id":1}}`))
+	}))
+	defer server.Close()
+	client, err := NewClient(ClientConfig{Token: "secret", BaseURL: server.URL, HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.SendMessageWithURLButton(
+		context.Background(), 123, "Помощь", "Добавить в группу",
+		"https://t.me/AntiSpamBeeBot?startgroup=setup&admin=delete_messages+restrict_members",
+	); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestClientSetWebhookIncludesReactionUpdates(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/botsecret/setWebhook" {

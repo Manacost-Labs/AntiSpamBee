@@ -25,6 +25,7 @@ type commandStore interface {
 type commandTelegram interface {
 	GetChatMemberStatus(context.Context, int64, int64) (string, error)
 	SendMessage(context.Context, int64, string) error
+	SendMessageWithURLButton(context.Context, int64, string, string, string) error
 }
 
 type eventProcessor interface {
@@ -38,6 +39,7 @@ type CommandRouter struct {
 	telegram        commandTelegram
 	fallback        eventProcessor
 	moderatorChatID int64
+	addToGroupURL   string
 	now             func() time.Time
 }
 
@@ -46,13 +48,18 @@ func NewCommandRouter(
 	telegram commandTelegram,
 	fallback eventProcessor,
 	moderatorChatID int64,
+	botUsername string,
 ) (*CommandRouter, error) {
 	if store == nil || telegram == nil || fallback == nil {
 		return nil, fmt.Errorf("command store, Telegram client, and fallback processor are required")
 	}
+	addToGroupURL, err := botAddToGroupURL(botUsername)
+	if err != nil {
+		return nil, err
+	}
 	return &CommandRouter{
 		store: store, telegram: telegram, fallback: fallback,
-		moderatorChatID: moderatorChatID, now: time.Now,
+		moderatorChatID: moderatorChatID, addToGroupURL: addToGroupURL, now: time.Now,
 	}, nil
 }
 
@@ -66,7 +73,9 @@ func (r *CommandRouter) Process(ctx context.Context, event events.TelegramUpdate
 		if err := r.recordCommand(ctx, event, nil); err != nil {
 			return err
 		}
-		return r.telegram.SendMessage(ctx, command.ChatID, commandHelp())
+		return r.telegram.SendMessageWithURLButton(
+			ctx, command.ChatID, commandHelp(), "➕ Добавить в группу", r.addToGroupURL,
+		)
 	case "report":
 		if command.ReplyUserID <= 0 || command.ReplyMessageID <= 0 {
 			return r.respondToInvalidCommand(ctx, event, command.ChatID, "Ответьте командой /report на подозрительное сообщение.")
@@ -306,5 +315,37 @@ func (r *CommandRouter) recordCommand(ctx context.Context, event events.Telegram
 }
 
 func commandHelp() string {
-	return "AntiSpamBee активен. Команды: /report, /status, /protection, /allow, /unallow, /warn, /mute, /ban, /unban. Команды действий используйте ответом на сообщение."
+	return `🐝 AntiSpamBee — защита группы от рекламы и спама.
+
+Для участников:
+/report — пожаловаться ответом на сообщение
+/help — открыть этот справочник
+
+Для администраторов:
+/status — текущий режим защиты
+/protection observe — только наблюдение
+/protection soft — ручная модерация
+/protection standard — удаление рекламы без автобана
+/protection strict — удаление и автобан при риске 100%
+/allow и /unallow — добавить или убрать автора из исключений
+/warn — предупредить автора
+/mute — ограничить автора на 1 час
+/ban — заблокировать автора
+/unban USER_ID — снять блокировку
+
+/report, /allow, /unallow, /warn, /mute и /ban отправляйте ответом на сообщение пользователя.`
+}
+
+func botAddToGroupURL(username string) (string, error) {
+	if len(username) < 5 || len(username) > 32 {
+		return "", fmt.Errorf("valid Telegram bot username is required")
+	}
+	for _, char := range username {
+		if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') ||
+			(char >= '0' && char <= '9') || char == '_' {
+			continue
+		}
+		return "", fmt.Errorf("valid Telegram bot username is required")
+	}
+	return "https://t.me/" + username + "?startgroup=setup&admin=delete_messages+restrict_members", nil
 }

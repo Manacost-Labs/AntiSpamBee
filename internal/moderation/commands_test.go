@@ -2,6 +2,7 @@ package moderation
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"antispambee/internal/events"
@@ -39,9 +40,11 @@ func (s *commandStoreStub) GetCommunityPolicy(context.Context, string, int64, in
 }
 
 type commandTelegramStub struct {
-	status   string
-	statuses map[int64]string
-	messages []string
+	status     string
+	statuses   map[int64]string
+	messages   []string
+	buttonText string
+	buttonURL  string
 }
 
 func (t *commandTelegramStub) GetChatMemberStatus(_ context.Context, _ int64, userID int64) (string, error) {
@@ -52,6 +55,12 @@ func (t *commandTelegramStub) GetChatMemberStatus(_ context.Context, _ int64, us
 }
 func (t *commandTelegramStub) SendMessage(_ context.Context, _ int64, message string) error {
 	t.messages = append(t.messages, message)
+	return nil
+}
+func (t *commandTelegramStub) SendMessageWithURLButton(_ context.Context, _ int64, message, buttonText, buttonURL string) error {
+	t.messages = append(t.messages, message)
+	t.buttonText = buttonText
+	t.buttonURL = buttonURL
 	return nil
 }
 
@@ -65,7 +74,7 @@ func (f *fallbackStub) Process(context.Context, events.TelegramUpdate) error {
 func TestCommandRouterQueuesModeratorBan(t *testing.T) {
 	store := &commandStoreStub{}
 	telegram := &commandTelegramStub{statuses: map[int64]string{1: "administrator", 42: "member"}}
-	router, err := NewCommandRouter(store, telegram, &fallbackStub{}, 0)
+	router, err := NewCommandRouter(store, telegram, &fallbackStub{}, 0, "AntiSpamBeeBot")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,7 +90,7 @@ func TestCommandRouterQueuesModeratorBan(t *testing.T) {
 func TestCommandRouterRecordsUserReport(t *testing.T) {
 	store := &commandStoreStub{}
 	telegram := &commandTelegramStub{status: "member"}
-	router, err := NewCommandRouter(store, telegram, &fallbackStub{}, -10099)
+	router, err := NewCommandRouter(store, telegram, &fallbackStub{}, -10099, "AntiSpamBeeBot")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -97,7 +106,7 @@ func TestCommandRouterRecordsUserReport(t *testing.T) {
 func TestCommandRouterQueuesUnbanByUserID(t *testing.T) {
 	store := &commandStoreStub{}
 	telegram := &commandTelegramStub{statuses: map[int64]string{1: "administrator", 42: "kicked"}}
-	router, err := NewCommandRouter(store, telegram, &fallbackStub{}, 0)
+	router, err := NewCommandRouter(store, telegram, &fallbackStub{}, 0, "AntiSpamBeeBot")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,7 +122,7 @@ func TestCommandRouterQueuesUnbanByUserID(t *testing.T) {
 func TestCommandRouterChangesProtectionLevelForAdmin(t *testing.T) {
 	store := &commandStoreStub{}
 	telegram := &commandTelegramStub{status: "creator"}
-	router, err := NewCommandRouter(store, telegram, &fallbackStub{}, 0)
+	router, err := NewCommandRouter(store, telegram, &fallbackStub{}, 0, "AntiSpamBeeBot")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +137,7 @@ func TestCommandRouterChangesProtectionLevelForAdmin(t *testing.T) {
 
 func TestCommandRouterDelegatesNormalMessages(t *testing.T) {
 	fallback := &fallbackStub{}
-	router, err := NewCommandRouter(&commandStoreStub{}, &commandTelegramStub{}, fallback, 0)
+	router, err := NewCommandRouter(&commandStoreStub{}, &commandTelegramStub{}, fallback, 0, "AntiSpamBeeBot")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,5 +146,33 @@ func TestCommandRouterDelegatesNormalMessages(t *testing.T) {
 	}
 	if fallback.calls != 1 {
 		t.Fatalf("fallback calls = %d", fallback.calls)
+	}
+}
+
+func TestCommandRouterStartOffersAdminInstallAndCommandGuide(t *testing.T) {
+	telegram := &commandTelegramStub{}
+	router, err := NewCommandRouter(&commandStoreStub{}, telegram, &fallbackStub{}, 0, "AntiSpamBeeBot")
+	if err != nil {
+		t.Fatal(err)
+	}
+	event := telegramEvent(`{"message":{"message_id":10,"from":{"id":1},"chat":{"id":1,"type":"private"},"text":"/start"}}`)
+	if err := router.Process(context.Background(), event); err != nil {
+		t.Fatal(err)
+	}
+	if len(telegram.messages) != 1 || !strings.Contains(telegram.messages[0], "/protection strict") || !strings.Contains(telegram.messages[0], "/report") {
+		t.Fatalf("help message = %q", telegram.messages)
+	}
+	if telegram.buttonText != "➕ Добавить в группу" || telegram.buttonURL != "https://t.me/AntiSpamBeeBot?startgroup=setup&admin=delete_messages+restrict_members" {
+		t.Fatalf("button = %q %q", telegram.buttonText, telegram.buttonURL)
+	}
+}
+
+func TestCommandRouterRejectsUnsafeBotUsername(t *testing.T) {
+	_, err := NewCommandRouter(
+		&commandStoreStub{}, &commandTelegramStub{}, &fallbackStub{}, 0,
+		"AntiSpamBeeBot?startgroup=x",
+	)
+	if err == nil {
+		t.Fatal("NewCommandRouter() accepted an unsafe bot username")
 	}
 }

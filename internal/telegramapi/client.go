@@ -270,6 +270,62 @@ func (c *Client) SendMessage(ctx context.Context, chatID int64, text string) err
 	return nil
 }
 
+// GetBotUsername returns the authenticated bot username used in Telegram deep links.
+func (c *Client) GetBotUsername(ctx context.Context) (string, error) {
+	var bot struct {
+		Username string `json:"username"`
+	}
+	if err := c.call(ctx, "getMe", struct{}{}, &bot); err != nil {
+		return "", fmt.Errorf("get Telegram bot identity: %w", err)
+	}
+	if strings.TrimSpace(bot.Username) == "" {
+		return "", fmt.Errorf("get Telegram bot identity: invalid username")
+	}
+	return bot.Username, nil
+}
+
+// SendMessageWithURLButton sends plain text with one HTTPS inline URL button.
+func (c *Client) SendMessageWithURLButton(
+	ctx context.Context,
+	chatID int64,
+	text string,
+	buttonText string,
+	buttonURL string,
+) error {
+	if chatID == 0 {
+		return fmt.Errorf("Telegram chat ID must not be zero")
+	}
+	if strings.TrimSpace(text) == "" || len([]rune(text)) > 4096 {
+		return fmt.Errorf("Telegram message text must contain 1 to 4096 characters")
+	}
+	if strings.TrimSpace(buttonText) == "" || len([]rune(buttonText)) > 64 {
+		return fmt.Errorf("Telegram button text must contain 1 to 64 characters")
+	}
+	parsedURL, err := url.Parse(buttonURL)
+	if err != nil || parsedURL.Scheme != "https" || parsedURL.Host == "" || parsedURL.User != nil {
+		return fmt.Errorf("Telegram button URL must be an absolute HTTPS URL")
+	}
+	var sent message
+	request := struct {
+		ChatID      int64  `json:"chat_id"`
+		Text        string `json:"text"`
+		ReplyMarkup struct {
+			InlineKeyboard [][]struct {
+				Text string `json:"text"`
+				URL  string `json:"url"`
+			} `json:"inline_keyboard"`
+		} `json:"reply_markup"`
+	}{ChatID: chatID, Text: text}
+	request.ReplyMarkup.InlineKeyboard = [][]struct {
+		Text string `json:"text"`
+		URL  string `json:"url"`
+	}{{{Text: buttonText, URL: buttonURL}}}
+	if err := c.call(ctx, "sendMessage", request, &sent); err != nil {
+		return fmt.Errorf("send Telegram message with URL button: %w", err)
+	}
+	return nil
+}
+
 // SetWebhook registers all update types consumed by AntiSpamBee, including
 // reactions which Telegram excludes from the default subscription.
 func (c *Client) SetWebhook(ctx context.Context, webhookURL, secret string) error {

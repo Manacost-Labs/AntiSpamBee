@@ -130,7 +130,13 @@ func consume(
 	if err != nil {
 		return err
 	}
-	router, err := moderation.NewCommandRouter(store, profiles, processor, moderatorChatID)
+	identityCtx, cancelIdentity := context.WithTimeout(ctx, 10*time.Second)
+	botUsername, err := profiles.GetBotUsername(identityCtx)
+	cancelIdentity()
+	if err != nil {
+		return err
+	}
+	router, err := moderation.NewCommandRouter(store, profiles, processor, moderatorChatID, botUsername)
 	if err != nil {
 		return err
 	}
