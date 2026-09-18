@@ -272,8 +272,8 @@ func (s *Store) GetCommunityPolicy(
 	chatID int64,
 	userID int64,
 ) (moderation.CommunityPolicy, error) {
-	if tenantID == "" || chatID == 0 || userID <= 0 {
-		return moderation.CommunityPolicy{}, fmt.Errorf("valid tenant, chat, and user are required")
+	if err := validateCommunityPolicyLookup(tenantID, chatID, userID); err != nil {
+		return moderation.CommunityPolicy{}, err
 	}
 	policy := moderation.CommunityPolicy{
 		ProtectionLevel:         "STRICT",
@@ -308,6 +308,13 @@ func (s *Store) GetCommunityPolicy(
 		return moderation.CommunityPolicy{}, fmt.Errorf("query community moderation policy: %w", err)
 	}
 	return policy, nil
+}
+
+func validateCommunityPolicyLookup(tenantID string, chatID, userID int64) error {
+	if tenantID == "" || chatID == 0 || userID < 0 {
+		return fmt.Errorf("valid tenant and chat plus a non-negative user are required")
+	}
+	return nil
 }
 
 // SetCommunityProtection upserts the Telegram-configured policy preset.

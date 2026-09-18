@@ -322,6 +322,13 @@ func TestStorePersistsCommunityPolicyAllowlistAndReportIdempotently(t *testing.T
 	if policy.ProtectionLevel != "OBSERVE" || policy.AutomaticActionsEnabled || policy.AutobanEnabled || !policy.IsAllowlisted {
 		t.Fatalf("policy = %#v", policy)
 	}
+	senderChatPolicy, err := store.GetCommunityPolicy(ctx, tenantID, -1001, 0)
+	if err != nil {
+		t.Fatalf("load sender_chat policy: %v", err)
+	}
+	if senderChatPolicy.ProtectionLevel != "OBSERVE" || senderChatPolicy.AutomaticActionsEnabled || senderChatPolicy.AutobanEnabled || senderChatPolicy.IsAllowlisted {
+		t.Fatalf("sender_chat policy = %#v", senderChatPolicy)
+	}
 	for range 2 {
 		if err := store.RecordUserReport(ctx, tenantID, -1001, 7, 42, 99); err != nil {
 			t.Fatal(err)
