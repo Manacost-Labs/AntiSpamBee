@@ -216,3 +216,61 @@ func TestClientGetChatMemberStatus(t *testing.T) {
 		t.Fatalf("status = %q", status)
 	}
 }
+
+func TestClientRestrictChatMember(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/botsecret/restrictChatMember" {
+			t.Fatalf("path = %q", r.URL.Path)
+		}
+		var request struct {
+			ChatID      int64 `json:"chat_id"`
+			UserID      int64 `json:"user_id"`
+			UntilDate   int64 `json:"until_date"`
+			Permissions struct {
+				CanSendMessages bool `json:"can_send_messages"`
+			} `json:"permissions"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		if request.ChatID != -100123 || request.UserID != 42 || request.UntilDate != 4102444800 || request.Permissions.CanSendMessages {
+			t.Fatalf("request = %#v", request)
+		}
+		_, _ = w.Write([]byte(`{"ok":true,"result":true}`))
+	}))
+	defer server.Close()
+	client, err := NewClient(ClientConfig{Token: "secret", BaseURL: server.URL, HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.RestrictChatMember(context.Background(), -100123, 42, 4102444800); err != nil {
+		t.Fatalf("RestrictChatMember() error = %v", err)
+	}
+}
+
+func TestClientSendMessage(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/botsecret/sendMessage" {
+			t.Fatalf("path = %q", r.URL.Path)
+		}
+		var request struct {
+			ChatID int64  `json:"chat_id"`
+			Text   string `json:"text"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		if request.ChatID != -100123 || request.Text != "готово" {
+			t.Fatalf("request = %#v", request)
+		}
+		_, _ = w.Write([]byte(`{"ok":true,"result":{"message_id":1,"date":1,"chat":{"id":-100123,"type":"supergroup"},"text":"готово"}}`))
+	}))
+	defer server.Close()
+	client, err := NewClient(ClientConfig{Token: "secret", BaseURL: server.URL, HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.SendMessage(context.Background(), -100123, "готово"); err != nil {
+		t.Fatalf("SendMessage() error = %v", err)
+	}
+}

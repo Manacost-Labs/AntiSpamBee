@@ -187,6 +187,52 @@ func (c *Client) DeleteMessageReaction(ctx context.Context, chatID, messageID, u
 	return nil
 }
 
+// RestrictChatMember mutes a user until the supplied Unix timestamp.
+func (c *Client) RestrictChatMember(ctx context.Context, chatID, userID, untilDate int64) error {
+	if chatID == 0 {
+		return fmt.Errorf("Telegram chat ID must not be zero")
+	}
+	if userID <= 0 {
+		return fmt.Errorf("Telegram user ID must be positive")
+	}
+	if untilDate <= time.Now().Unix() {
+		return fmt.Errorf("Telegram mute expiration must be in the future")
+	}
+	var restricted bool
+	if err := c.call(ctx, "restrictChatMember", struct {
+		ChatID      int64 `json:"chat_id"`
+		UserID      int64 `json:"user_id"`
+		UntilDate   int64 `json:"until_date"`
+		Permissions struct {
+			CanSendMessages bool `json:"can_send_messages"`
+		} `json:"permissions"`
+	}{ChatID: chatID, UserID: userID, UntilDate: untilDate}, &restricted); err != nil {
+		return fmt.Errorf("restrict Telegram chat member: %w", err)
+	}
+	if !restricted {
+		return fmt.Errorf("restrict Telegram chat member: Telegram returned false")
+	}
+	return nil
+}
+
+// SendMessage sends a plain-text bot response without parse-mode injection.
+func (c *Client) SendMessage(ctx context.Context, chatID int64, text string) error {
+	if chatID == 0 {
+		return fmt.Errorf("Telegram chat ID must not be zero")
+	}
+	if strings.TrimSpace(text) == "" || len([]rune(text)) > 4096 {
+		return fmt.Errorf("Telegram message text must contain 1 to 4096 characters")
+	}
+	var sent message
+	if err := c.call(ctx, "sendMessage", struct {
+		ChatID int64  `json:"chat_id"`
+		Text   string `json:"text"`
+	}{ChatID: chatID, Text: text}, &sent); err != nil {
+		return fmt.Errorf("send Telegram message: %w", err)
+	}
+	return nil
+}
+
 // GetChatMemberStatus returns member, administrator, creator, restricted,
 // left, or kicked as reported by Telegram.
 func (c *Client) GetChatMemberStatus(ctx context.Context, chatID, userID int64) (string, error) {
@@ -272,8 +318,9 @@ type chatFullInfo struct {
 }
 
 type message struct {
-	Text    string `json:"text"`
-	Caption string `json:"caption"`
+	MessageID int64  `json:"message_id"`
+	Text      string `json:"text"`
+	Caption   string `json:"caption"`
 }
 
 func firstNonEmpty(values ...string) string {

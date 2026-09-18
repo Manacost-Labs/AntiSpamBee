@@ -39,6 +39,7 @@ type ActionRequest struct {
 	Type           ActionType
 	Target         ActionTarget
 	IdempotencyKey string
+	UntilDate      int64
 }
 
 type terminalRecorder interface {

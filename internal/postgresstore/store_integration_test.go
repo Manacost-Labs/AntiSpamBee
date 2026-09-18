@@ -265,3 +265,49 @@ func TestStoreObserveMessageCountsDuplicateAndFlood(t *testing.T) {
 		t.Fatalf("behavior stats = %#v", stats)
 	}
 }
+
+func TestStorePersistsCommunityPolicyAllowlistAndReportIdempotently(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	if _, err := pool.Exec(ctx, "TRUNCATE user_reports, moderation_allowlist, community_policies"); err != nil {
+		t.Fatal(err)
+	}
+	store, err := New(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tenantID := "9d83e552-8910-4c46-b55a-63074078829e"
+	if err := store.SetCommunityProtection(ctx, tenantID, -1001, "OBSERVE"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetAllowlisted(ctx, tenantID, -1001, 42, 1, true); err != nil {
+		t.Fatal(err)
+	}
+	policy, err := store.GetCommunityPolicy(ctx, tenantID, -1001, 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if policy.ProtectionLevel != "OBSERVE" || policy.AutomaticActionsEnabled || !policy.IsAllowlisted {
+		t.Fatalf("policy = %#v", policy)
+	}
+	for range 2 {
+		if err := store.RecordUserReport(ctx, tenantID, -1001, 7, 42, 99); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var reportCount int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM user_reports").Scan(&reportCount); err != nil {
+		t.Fatal(err)
+	}
+	if reportCount != 1 {
+		t.Fatalf("report count = %d", reportCount)
+	}
+}

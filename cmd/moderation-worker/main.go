@@ -95,7 +95,7 @@ func run(ctx context.Context, config config) error {
 		)
 		if err == nil {
 			cancelProvision()
-			return consume(ctx, consumer, pool, profiles, semantic, config.RetryDelay)
+			return consume(ctx, consumer, pool, profiles, semantic, config.RetryDelay, config.ModeratorChatID)
 		}
 	}
 	cancelProvision()
@@ -109,6 +109,7 @@ func consume(
 	profiles *telegramapi.Client,
 	semantic *openrouter.Client,
 	retryDelay time.Duration,
+	moderatorChatID int64,
 ) error {
 	store, err := postgresstore.New(pool)
 	if err != nil {
@@ -125,7 +126,11 @@ func consume(
 	if err != nil {
 		return err
 	}
-	handler, err := eventstream.NewHandler(processor, retryDelay)
+	router, err := moderation.NewCommandRouter(store, profiles, processor, moderatorChatID)
+	if err != nil {
+		return err
+	}
+	handler, err := eventstream.NewHandler(router, retryDelay)
 	if err != nil {
 		return err
 	}

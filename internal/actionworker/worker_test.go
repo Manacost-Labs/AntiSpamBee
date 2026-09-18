@@ -48,6 +48,7 @@ type telegramStub struct {
 	bans              int
 	messageDeletes    int
 	reactionDeletes   int
+	mutes             int
 }
 
 func (t *telegramStub) BanChatMember(context.Context, int64, int64) error {
@@ -65,6 +66,10 @@ func (t *telegramStub) DeleteMessageReaction(context.Context, int64, int64, int6
 func (t *telegramStub) GetChatMemberStatus(context.Context, int64, int64) (string, error) {
 	return t.memberStatus, t.memberStatusErr
 }
+func (t *telegramStub) RestrictChatMember(context.Context, int64, int64, int64) error {
+	t.mutes++
+	return nil
+}
 
 func TestWorkerExecutesDeleteReaction(t *testing.T) {
 	repo := &repositoryStub{found: true, action: claimedAction(moderation.ActionDeleteReaction, 1)}
@@ -77,6 +82,18 @@ func TestWorkerExecutesDeleteReaction(t *testing.T) {
 	}
 	if telegram.reactionDeletes != 1 || !repo.succeeded {
 		t.Fatalf("reaction deletes = %d, succeeded = %v", telegram.reactionDeletes, repo.succeeded)
+	}
+}
+
+func TestWorkerExecutesMute(t *testing.T) {
+	action := claimedAction(moderation.ActionMuteUser, 1)
+	action.UntilDate = 4102444800
+	repo := &repositoryStub{found: true, action: action}
+	telegram := &telegramStub{}
+	worker := newTestWorker(t, repo, telegram)
+	worked, err := worker.RunOnce(context.Background())
+	if err != nil || !worked || telegram.mutes != 1 || !repo.succeeded {
+		t.Fatalf("worked/error/mutes/succeeded = %v/%v/%d/%v", worked, err, telegram.mutes, repo.succeeded)
 	}
 }
 

@@ -37,6 +37,7 @@ type TelegramClient interface {
 	DeleteMessage(context.Context, int64, int64) error
 	DeleteMessageReaction(context.Context, int64, int64, int64) error
 	GetChatMemberStatus(context.Context, int64, int64) (string, error)
+	RestrictChatMember(context.Context, int64, int64, int64) error
 }
 
 // Worker leases and executes one durable moderation action at a time.
@@ -121,6 +122,8 @@ func (w *Worker) execute(ctx context.Context, action moderation.ClaimedAction) (
 			}
 		}
 		return false, w.telegram.BanChatMember(ctx, target.ChatID, target.UserID)
+	case moderation.ActionMuteUser:
+		return false, w.telegram.RestrictChatMember(ctx, target.ChatID, target.UserID, action.UntilDate)
 	default:
 		return false, fmt.Errorf("unsupported moderation action %q", action.Type)
 	}

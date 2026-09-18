@@ -62,7 +62,8 @@ func (s *Store) ClaimAction(
 			action.chat_id,
 			action.user_id,
 			action.message_id,
-			action.attempt_count
+			action.attempt_count,
+			COALESCE(action.until_date, 0)
 	`, owner, lease.Milliseconds()).Scan(
 		&action.ActionID,
 		&action.EventID,
@@ -73,6 +74,7 @@ func (s *Store) ClaimAction(
 		&action.Target.UserID,
 		&action.Target.MessageID,
 		&action.AttemptCount,
+		&action.UntilDate,
 	)
 	if errorsIsNoRows(err) {
 		return moderation.ClaimedAction{}, false, nil
@@ -87,6 +89,8 @@ func (s *Store) ClaimAction(
 	case moderation.ActionDeleteReaction:
 		action.Target.Kind = moderation.TargetReaction
 	case moderation.ActionBanUser:
+		action.Target.Kind = moderation.TargetMessage
+	case moderation.ActionMuteUser:
 		action.Target.Kind = moderation.TargetMessage
 	}
 	return action, true, nil
@@ -296,6 +300,85 @@ func (s *Store) GetCommunityPolicy(
 	return policy, nil
 }
 
+// SetCommunityProtection upserts the Telegram-configured policy preset.
+func (s *Store) SetCommunityProtection(
+	ctx context.Context,
+	tenantID string,
+	chatID int64,
+	level string,
+) error {
+	automaticActions := level != "OBSERVE"
+	command, err := s.pool.Exec(ctx, `
+		INSERT INTO community_policies (
+			tenant_id, chat_id, protection_level, automatic_actions_enabled
+		)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (tenant_id, chat_id) DO UPDATE
+		SET protection_level = EXCLUDED.protection_level,
+			automatic_actions_enabled = EXCLUDED.automatic_actions_enabled,
+			updated_at = now()
+	`, tenantID, chatID, level, automaticActions)
+	if err != nil {
+		return fmt.Errorf("set community protection: %w", err)
+	}
+	if command.RowsAffected() != 1 {
+		return fmt.Errorf("set community protection: no row changed")
+	}
+	return nil
+}
+
+// SetAllowlisted adds or removes one protected community member.
+func (s *Store) SetAllowlisted(
+	ctx context.Context,
+	tenantID string,
+	chatID int64,
+	userID int64,
+	addedBy int64,
+	allowed bool,
+) error {
+	if allowed {
+		_, err := s.pool.Exec(ctx, `
+			INSERT INTO moderation_allowlist (tenant_id, chat_id, user_id, added_by)
+			VALUES ($1, $2, $3, $4)
+			ON CONFLICT (tenant_id, chat_id, user_id) DO UPDATE
+			SET added_by = EXCLUDED.added_by
+		`, tenantID, chatID, userID, addedBy)
+		if err != nil {
+			return fmt.Errorf("add moderation allowlist entry: %w", err)
+		}
+		return nil
+	}
+	if _, err := s.pool.Exec(ctx, `
+		DELETE FROM moderation_allowlist
+		WHERE tenant_id = $1 AND chat_id = $2 AND user_id = $3
+	`, tenantID, chatID, userID); err != nil {
+		return fmt.Errorf("remove moderation allowlist entry: %w", err)
+	}
+	return nil
+}
+
+// RecordUserReport inserts one idempotent report per reporter and message.
+func (s *Store) RecordUserReport(
+	ctx context.Context,
+	tenantID string,
+	chatID int64,
+	reporterUserID int64,
+	reportedUserID int64,
+	messageID int64,
+) error {
+	_, err := s.pool.Exec(ctx, `
+		INSERT INTO user_reports (
+			tenant_id, chat_id, reporter_user_id, reported_user_id, message_id
+		)
+		VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (tenant_id, chat_id, reporter_user_id, message_id) DO NOTHING
+	`, tenantID, chatID, reporterUserID, reportedUserID, messageID)
+	if err != nil {
+		return fmt.Errorf("record user report: %w", err)
+	}
+	return nil
+}
+
 // RecordTerminal inserts an outcome once. A retry of the same event succeeds
 // without changing the original record; conflicting event identity is rejected.
 func (s *Store) RecordTerminal(
@@ -444,9 +527,10 @@ func (s *Store) RecordTerminal(
 				action_type,
 				chat_id,
 				user_id,
-				message_id
+				message_id,
+				until_date
 			)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULLIF($9, 0))
 			ON CONFLICT (idempotency_key) DO NOTHING
 		`,
 			decisionID,
@@ -457,6 +541,7 @@ func (s *Store) RecordTerminal(
 			outcome.Action.Target.ChatID,
 			outcome.Action.Target.UserID,
 			outcome.Action.Target.MessageID,
+			outcome.Action.UntilDate,
 		)
 		if err != nil {
 			return fmt.Errorf("insert moderation action for event %q: %w", event.SourceKey, err)

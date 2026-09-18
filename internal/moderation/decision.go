@@ -16,6 +16,7 @@ const (
 	ActionDeleteMessage  ActionType = "DELETE_MESSAGE"
 	ActionDeleteReaction ActionType = "DELETE_REACTION"
 	ActionBanUser        ActionType = "BAN_USER"
+	ActionMuteUser       ActionType = "MUTE_USER"
 )
 
 // TargetKind describes the Telegram object that can be moderated.
@@ -54,6 +55,7 @@ type ClaimedAction struct {
 	Type         ActionType
 	Target       ActionTarget
 	AttemptCount int
+	UntilDate    int64
 }
 
 // DecisionInput is the complete, already-enriched input to the decision engine.
@@ -155,6 +157,8 @@ func actionIdempotencyKey(eventID string, action ActionType, target ActionTarget
 		return fmt.Sprintf("delete-reaction:%d:%d:%d:%s", target.ChatID, target.MessageID, target.UserID, eventID)
 	case ActionDeleteMessage:
 		return fmt.Sprintf("delete-message:%d:%d:%s", target.ChatID, target.MessageID, eventID)
+	case ActionMuteUser:
+		return fmt.Sprintf("mute:%d:%d:%s", target.ChatID, target.UserID, eventID)
 	default:
 		return ""
 	}

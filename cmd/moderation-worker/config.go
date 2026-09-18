@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"strconv"
 	"time"
 )
 
@@ -16,6 +17,7 @@ type config struct {
 	Subject           string
 	Consumer          string
 	RetryDelay        time.Duration
+	ModeratorChatID   int64
 }
 
 func loadConfig(getenv func(string) string) (config, error) {
@@ -28,6 +30,14 @@ func loadConfig(getenv func(string) string) (config, error) {
 		return config{}, fmt.Errorf("TELEGRAM_BOT_TOKEN is required")
 	}
 	openRouterAPIKey := getenv("OPENROUTER_API_KEY")
+	var moderatorChatID int64
+	if raw := getenv("MODERATOR_CHAT_ID"); raw != "" {
+		parsed, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || parsed == 0 {
+			return config{}, fmt.Errorf("MODERATOR_CHAT_ID must be a non-zero integer")
+		}
+		moderatorChatID = parsed
+	}
 
 	return config{
 		DatabaseURL:       databaseURL,
@@ -40,6 +50,7 @@ func loadConfig(getenv func(string) string) (config, error) {
 		Subject:           valueOrDefault(getenv("NATS_SUBJECT"), "telegram.events"),
 		Consumer:          valueOrDefault(getenv("NATS_CONSUMER"), "moderation-worker"),
 		RetryDelay:        5 * time.Second,
+		ModeratorChatID:   moderatorChatID,
 	}, nil
 }
 
