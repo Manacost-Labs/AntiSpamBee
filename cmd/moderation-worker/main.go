@@ -2,10 +2,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -95,7 +98,7 @@ func run(ctx context.Context, config config) error {
 		)
 		if err == nil {
 			cancelProvision()
-			return consume(ctx, consumer, pool, profiles, semantic, config.RetryDelay, config.ModeratorChatID)
+			return consume(ctx, consumer, pool, profiles, semantic, config.RetryDelay, config.ModeratorChatID, config.HTTPAddress)
 		}
 	}
 	cancelProvision()
@@ -110,6 +113,7 @@ func consume(
 	semantic *openrouter.Client,
 	retryDelay time.Duration,
 	moderatorChatID int64,
+	httpAddress string,
 ) error {
 	store, err := postgresstore.New(pool)
 	if err != nil {
@@ -135,11 +139,15 @@ func consume(
 		return err
 	}
 
+	metrics := &workerMetrics{}
 	consumeContext, err := consumer.Consume(
 		func(message jetstream.Msg) {
 			if err := handler.Handle(ctx, message); err != nil {
+				metrics.failed.Add(1)
 				slog.Error("moderation event processing failed", "error", err)
+				return
 			}
+			metrics.processed.Add(1)
 		},
 		jetstream.ConsumeErrHandler(func(_ jetstream.ConsumeContext, err error) {
 			slog.Error("JetStream consumer error", "error", err)
@@ -149,9 +157,24 @@ func consume(
 		return fmt.Errorf("start moderation consumer: %w", err)
 	}
 
+	server := moderationHealthServer(httpAddress, pool, metrics)
+	serverErrors := make(chan error, 1)
+	go func() { serverErrors <- server.ListenAndServe() }()
 	slog.Info("moderation worker started")
-	<-ctx.Done()
+	select {
+	case <-ctx.Done():
+	case err := <-serverErrors:
+		if !errors.Is(err, http.ErrServerClosed) {
+			consumeContext.Stop()
+			return fmt.Errorf("serve moderation worker health endpoint: %w", err)
+		}
+	}
 	consumeContext.Drain()
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelShutdown()
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		return fmt.Errorf("shutdown moderation worker health endpoint: %w", err)
+	}
 
 	select {
 	case <-consumeContext.Closed():
@@ -159,5 +182,37 @@ func consume(
 	case <-time.After(10 * time.Second):
 		consumeContext.Stop()
 		return fmt.Errorf("drain moderation consumer: timeout")
+	}
+}
+
+type workerMetrics struct {
+	processed atomic.Uint64
+	failed    atomic.Uint64
+}
+
+func moderationHealthServer(address string, pool *pgxpool.Pool, metrics *workerMetrics) *http.Server {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, request *http.Request) {
+		ctx, cancel := context.WithTimeout(request.Context(), time.Second)
+		defer cancel()
+		if err := pool.Ping(ctx); err != nil {
+			http.Error(w, "not ready", http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+		_, _ = fmt.Fprintf(w,
+			"antispambee_events_processed_total %d\nantispambee_events_failed_total %d\n",
+			metrics.processed.Load(), metrics.failed.Load(),
+		)
+	})
+	return &http.Server{
+		Addr: address, Handler: mux, ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout: 10 * time.Second, WriteTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second,
 	}
 }

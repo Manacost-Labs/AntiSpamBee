@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_DB: antispambee_test
+          POSTGRES_USER: antispambee
+          POSTGRES_PASSWORD: test-only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U antispambee -d antispambee_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      TEST_DATABASE_URL: postgres://antispambee:test-only@127.0.0.1:5432/antispambee_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Apply test migrations
+        run: |
+          for migration in migrations/*.sql; do
+            sed '/^-- +goose Down$/,$d' "$migration" | psql "$TEST_DATABASE_URL" --set ON_ERROR_STOP=1
+          done
+      - name: Test with race detector
+        run: go test -race ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Build services
+        run: |
+          go build ./cmd/gateway
+          go build ./cmd/moderation-worker
+          go build ./cmd/action-worker
+          go build ./cmd/setup-webhook

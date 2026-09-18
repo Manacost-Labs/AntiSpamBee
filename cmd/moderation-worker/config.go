@@ -18,6 +18,7 @@ type config struct {
 	Consumer          string
 	RetryDelay        time.Duration
 	ModeratorChatID   int64
+	HTTPAddress       string
 }
 
 func loadConfig(getenv func(string) string) (config, error) {
@@ -51,6 +52,7 @@ func loadConfig(getenv func(string) string) (config, error) {
 		Consumer:          valueOrDefault(getenv("NATS_CONSUMER"), "moderation-worker"),
 		RetryDelay:        5 * time.Second,
 		ModeratorChatID:   moderatorChatID,
+		HTTPAddress:       valueOrDefault(getenv("MODERATION_WORKER_HTTP_ADDR"), ":8082"),
 	}, nil
 }
 

@@ -1,0 +1,86 @@
+services:
+  nats:
+    image: nats:2.14.6-alpine
+    command: ["--jetstream", "--store_dir=/data", "--http_port=8222"]
+    restart: unless-stopped
+    volumes:
+      - nats-data:/data
+
+  postgres:
+    image: postgres:17.11-alpine3.24
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: antispambee
+      POSTGRES_USER: antispambee
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U antispambee -d antispambee"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  migrate:
+    image: postgres:17.11-alpine3.24
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://antispambee@postgres:5432/antispambee?sslmode=disable
+      PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    entrypoint: ["/run-migrations.sh"]
+    volumes:
+      - ./migrations:/migrations:ro
+      - ./docker/run-migrations.sh:/run-migrations.sh:ro
+    restart: "no"
+
+  gateway:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      args: {TARGET: gateway}
+    env_file: ${ENV_FILE:-.env}
+    environment:
+      NATS_URL: nats://nats:4222
+    depends_on:
+      nats:
+        condition: service_started
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+
+  moderation-worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      args: {TARGET: moderation-worker}
+    env_file: ${ENV_FILE:-.env}
+    environment:
+      DATABASE_URL: postgres://antispambee@postgres:5432/antispambee?sslmode=disable
+      PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      NATS_URL: nats://nats:4222
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      nats:
+        condition: service_started
+    restart: unless-stopped
+
+  action-worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      args: {TARGET: action-worker}
+    env_file: ${ENV_FILE:-.env}
+    environment:
+      DATABASE_URL: postgres://antispambee@postgres:5432/antispambee?sslmode=disable
+      PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+volumes:
+  nats-data:
+  postgres-data:

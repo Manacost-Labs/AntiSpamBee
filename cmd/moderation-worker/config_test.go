@@ -35,6 +35,9 @@ func TestLoadConfigUsesSafeDefaults(t *testing.T) {
 	if config.OpenRouterModel != "~typesafe/jev-latest" {
 		t.Errorf("OpenRouter model = %q", config.OpenRouterModel)
 	}
+	if config.HTTPAddress != ":8082" {
+		t.Errorf("HTTP address = %q", config.HTTPAddress)
+	}
 }
 
 func TestLoadConfigRequiresDatabaseURL(t *testing.T) {

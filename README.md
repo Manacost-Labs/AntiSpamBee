@@ -1,52 +1,68 @@
 # AntiSpamBee
 
-Первый реализованный срез принимает Telegram webhook и подтверждает его только
-после синхронного ACK от NATS JetStream. Отдельный worker получает профиль
-автора и его личный канал через Telegram Bot API, ищет массовые предложения
-работы и сохраняет объяснимый detector signal в PostgreSQL. Подозрительные
-авторы в группах, супергруппах и каналах автоматически блокируются с исходом
-`PROCESSED_ACTION`. События без однозначного пользователя или группового чата
-получают `PROCESSED_REVIEW`, остальные — `PROCESSED_ALLOW`.
+AntiSpamBee — Telegram-бот модерации рекламы и спама. Он анализирует сообщения,
+bio, личный канал пользователя и публичные реакции, сохраняет объяснимые сигналы
+и выполняет действия через надёжную очередь.
 
-Первое правило `PROFILE_JOB_01..04` ловит сочетания наподобие:
+## Что уже работает
 
-- «нужны/требуются сотрудники», «ищем людей»;
-- «частичная занятость», «удалённая работа», «свободный график»;
-- обещание дохода и призыв написать в личку.
+- защищённый Telegram webhook с ограничением размера и secret token;
+- NATS JetStream с durable consumer и дедупликацией по Telegram `update_id`;
+- PostgreSQL-события, detector signals, решения, действия и audit log;
+- реклама работы, adult/порно, VPN, казино, крипты, займов и обычные промо;
+- скрытые `text_link`, URL и базовая нормализация обфускации;
+- анализ bio, username, личного канала и его последних публикаций;
+- проверка профиля пользователя, поставившего реакцию;
+- flood, повторяющиеся сообщения и история предыдущих нарушений;
+- OpenRouter `~typesafe/jev-latest` в безопасном shadow-режиме;
+- allowlist, пользовательские жалобы и Telegram-команды модераторов;
+- идемпотентный Action Worker с lease, retry, `retry_after`, reconciliation и DLQ.
 
-Правила `PROFILE_ADULT_01..02` отправляют в review личные каналы с рекламой
-порно/18+, OnlyFans, нюдсов, интимных фото и видео, webcam и `xxx`. Общее
-упоминание взрослой темы без рекламного контекста само по себе не срабатывает.
+## Политика действий
 
-Реклама проверяется и в сообщениях, и в bio/личном канале профиля. Правила
-`*_VPN_01`, `*_GAMBLING_01`, `*_CRYPTO_01` и `*_LOAN_01` ловят соответственно
-продвижение VPN, казино/ставок, обещаний дохода на криптовалюте и займов. В
-сообщениях также работают `MESSAGE_AD_JOB_01` и `MESSAGE_AD_ADULT_01` для
-массового найма и рекламы adult-каналов. Общая связка
-«акция/скидка/промокод + заказать/купить + ссылка» покрывается правилом
-`*_GENERIC_01`. Скрытые `text_link`-ссылки учитываются. Обычная ссылка или
-нейтральное обсуждение чувствительной темы риск не повышают.
+```text
+risk < 0.90       → ALLOW
+risk 0.90–0.999…  → DELETE_MESSAGE или DELETE_REACTION
+risk = 1.00       → BAN_USER
+```
 
-Публичные `message_reaction` тоже запускают проверку bio и личного канала
-поставившего реакцию пользователя. При регистрации webhook необходимо явно
-включить `"message_reaction"` в `allowed_updates`: Telegram не присылает такие
-события по умолчанию. Для анонимной реакции доступен только `actor_chat`, без
-пользователя; такой профиль текущий срез проверить не может.
+Автоматическое действие дополнительно требует confidence `>= 0.90`, evidence
+coverage `>= 0.50`, разрешённую policy и непривилегированного пользователя.
+Администраторы, владелец и allowlist никогда не банятся автоматически. Ошибка
+проверки статуса пользователя приводит к review, а не к действию.
 
-Для автобана бот должен быть администратором чата с правом
-`can_restrict_members`. Используется постоянный `banChatMember`; если Telegram
-не подтверждает действие, событие не записывается как завершённое и остаётся
-на повторную обработку. В личных чатах автобан не выполняется.
+Jev остаётся shadow-detector: его результат хранится, но самостоятельно не
+удаляет сообщения и не банит пользователей.
 
-При заданном `OPENROUTER_API_KEY` worker дополнительно отправляет текст
-сообщения, bio и текст личного канала в OpenRouter Decisions API
-`/api/alpha/decisions` с моделью `~typesafe/jev-latest`. Ответ Jev сохраняется
-как отдельный сигнал `model.jev_advertising`. Сейчас он работает в shadow-режиме:
-не меняет `ALLOW/REVIEW/ACTION` и не может самостоятельно вызвать автобан.
-Отсутствие ключа полностью отключает этот detector, не мешая остальной
-модерации. Изображения в OpenRouter не отправляются.
+Поток выполнения:
 
-Отсутствие профиля или ошибка его загрузки сами по себе не повышают риск.
+```text
+Telegram → Gateway → JetStream → Detectors → Decision Engine
+                                      ↓
+PostgreSQL ← signals + decision + queued action
+                                      ↓
+                            Action Worker → Telegram
+```
+
+## Telegram-команды
+
+- `/start`, `/help` — справка;
+- `/report` — пожаловаться, отправив команду ответом на сообщение;
+- `/status` — текущий режим защиты;
+- `/protection observe|soft|standard|strict` — изменить режим;
+- `/allow`, `/unallow` — управление allowlist ответом на сообщение;
+- `/warn`, `/mute`, `/ban`, `/unban` — действие модератора ответом на сообщение.
+
+Административные команды проверяют статус вызывающего пользователя через
+`getChatMember`. `/ban` и `/mute` попадают в Action Worker, а не вызывают
+разрушительный Telegram API напрямую.
+
+Режимы: `OBSERVE` и `SOFT` оставляют решение модератору, `STANDARD` разрешает
+удаление без автобана, `STRICT` включает удаление и бан при risk `1.00`.
+
+Для удаления сообщений и реакций боту необходимо право
+`can_delete_messages`, для ban/mute — `can_restrict_members`. Webhook должен
+включать `message_reaction`; setup-команда делает это автоматически.
 
 ## Локальный запуск
 
@@ -55,42 +71,61 @@
 ```bash
 docker compose up -d
 cp .env.example .env
-# Заполните OPENROUTER_API_KEY, чтобы включить shadow-анализ Jev.
+# Заполните Telegram-параметры. OPENROUTER_API_KEY можно оставить пустым.
 set -a
 . ./.env
 set +a
 ```
 
-Запустите процессы в двух терминалах с загруженным `.env`:
+Запустите три процесса:
 
 ```bash
 go run ./cmd/gateway
-```
-
-```bash
 go run ./cmd/moderation-worker
+go run ./cmd/action-worker
 ```
 
-Проверка:
+После публикации HTTPS endpoint зарегистрируйте webhook:
 
 ```bash
-curl -i \
-  -X POST http://127.0.0.1:8080/telegram/webhook \
-  -H 'Content-Type: application/json' \
-  -H "X-Telegram-Bot-Api-Secret-Token: $TELEGRAM_WEBHOOK_SECRET" \
-  --data '{"update_id":789,"message":{"text":"hello"}}'
+go run ./cmd/setup-webhook
 ```
 
-Ожидаемый результат — `HTTP/1.1 200 OK`, затем одна строка для source key
-`telegram:$TELEGRAM_BOT_ID:789` в таблице `moderation_events` и один результат
-в `detector_signals`. Stream `TELEGRAM_EVENTS` создаётся с file storage,
-work-queue retention и семидневным окном дедупликации. Повтор того же webhook
-не создаёт вторую строку.
+Health endpoints:
 
-## Проверка кода
+- gateway: `:8080/healthz`, `:8080/readyz`;
+- action worker: `:8081/healthz`, `:8081/readyz`;
+- moderation worker: `:8082/healthz`, `:8082/readyz`, `:8082/metrics`.
+
+## Production Compose
+
+Задайте настоящий `POSTGRES_PASSWORD` и секреты в `.env`, затем:
 
 ```bash
-go test ./...
-go build -o ./bin/gateway ./cmd/gateway
-go build -o ./bin/moderation-worker ./cmd/moderation-worker
+docker compose -f compose.prod.yml up -d --build
 ```
+
+Сервис `migrate` применяет ещё не выполненные SQL-миграции до запуска workers.
+Не храните `.env` в Git. Если API-ключ когда-либо публиковался в чате или Git,
+его необходимо отозвать и создать новый.
+
+## Проверка
+
+```bash
+go test -race ./...
+go vet ./...
+go build ./cmd/gateway
+go build ./cmd/moderation-worker
+go build ./cmd/action-worker
+go build ./cmd/setup-webhook
+```
+
+CI поднимает PostgreSQL, применяет миграции, запускает integration tests, race
+detector, vet и сборку всех команд.
+
+## Ограничения текущего MVP
+
+- реклама, существующая только внутри картинки или аватара, пока не проходит OCR;
+- анонимную реакцию `actor_chat` нельзя связать с конкретным пользователем;
+- Jev нельзя переводить из shadow без размеченного golden set и проверки false positives;
+- production backup/restore и внешний маршрут апелляции настраиваются отдельно.
