@@ -38,6 +38,12 @@ type APIError struct {
 	RetryAfter  time.Duration
 }
 
+// BotCommand describes one command shown in Telegram's native slash menu.
+type BotCommand struct {
+	Command     string `json:"command"`
+	Description string `json:"description"`
+}
+
 func (e *APIError) Error() string {
 	return fmt.Sprintf("Telegram API error %d: %s", e.ErrorCode, e.Description)
 }
@@ -354,6 +360,49 @@ func (c *Client) SetWebhook(ctx context.Context, webhookURL, secret string) erro
 		return fmt.Errorf("set Telegram webhook: Telegram returned false")
 	}
 	return nil
+}
+
+// SetMyCommands replaces the default command list shown by Telegram clients.
+func (c *Client) SetMyCommands(ctx context.Context, commands []BotCommand) error {
+	if len(commands) == 0 || len(commands) > 100 {
+		return fmt.Errorf("Telegram command list must contain 1 to 100 commands")
+	}
+	seen := make(map[string]struct{}, len(commands))
+	for _, command := range commands {
+		if !validBotCommand(command.Command) {
+			return fmt.Errorf("invalid Telegram bot command %q", command.Command)
+		}
+		if strings.TrimSpace(command.Description) == "" || len([]rune(command.Description)) > 256 {
+			return fmt.Errorf("Telegram bot command %q has an invalid description", command.Command)
+		}
+		if _, exists := seen[command.Command]; exists {
+			return fmt.Errorf("duplicate Telegram bot command %q", command.Command)
+		}
+		seen[command.Command] = struct{}{}
+	}
+	var configured bool
+	if err := c.call(ctx, "setMyCommands", struct {
+		Commands []BotCommand `json:"commands"`
+	}{Commands: commands}, &configured); err != nil {
+		return fmt.Errorf("set Telegram bot commands: %w", err)
+	}
+	if !configured {
+		return fmt.Errorf("set Telegram bot commands: Telegram returned false")
+	}
+	return nil
+}
+
+func validBotCommand(command string) bool {
+	if len(command) == 0 || len(command) > 32 {
+		return false
+	}
+	for _, char := range command {
+		if (char >= 'a' && char <= 'z') || (char >= '0' && char <= '9') || char == '_' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func validWebhookSecret(secret string) bool {

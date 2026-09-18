@@ -378,3 +378,29 @@ func TestClientSetWebhookIncludesReactionUpdates(t *testing.T) {
 		t.Fatalf("SetWebhook() error = %v", err)
 	}
 }
+
+func TestClientSetMyCommands(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/botsecret/setMyCommands" {
+			t.Fatalf("path = %q", r.URL.Path)
+		}
+		var request struct {
+			Commands []BotCommand `json:"commands"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(request.Commands, []BotCommand{{Command: "help", Description: "Справочник"}}) {
+			t.Fatalf("commands = %#v", request.Commands)
+		}
+		_, _ = w.Write([]byte(`{"ok":true,"result":true}`))
+	}))
+	defer server.Close()
+	client, err := NewClient(ClientConfig{Token: "secret", BaseURL: server.URL, HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.SetMyCommands(context.Background(), []BotCommand{{Command: "help", Description: "Справочник"}}); err != nil {
+		t.Fatal(err)
+	}
+}
