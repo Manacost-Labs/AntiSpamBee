@@ -15,6 +15,31 @@ type recordingStore struct {
 	err     error
 }
 
+func hasAction(outcome Outcome, actionType ActionType) bool {
+	for _, action := range outcome.Actions {
+		if action.Type == actionType {
+			return true
+		}
+	}
+	return false
+}
+
+func TestActionRequestsForBanDeleteMessageBeforeUserBan(t *testing.T) {
+	target := ActionTarget{Kind: TargetMessage, ChatID: -1001, UserID: 42, MessageID: 7}
+
+	actions := actionRequestsFor("event-1", ActionBanUser, target)
+
+	if len(actions) != 2 {
+		t.Fatalf("actions = %#v, want delete and ban", actions)
+	}
+	if actions[0].Type != ActionDeleteMessage || actions[1].Type != ActionBanUser {
+		t.Fatalf("action order = %q/%q, want DELETE_MESSAGE/BAN_USER", actions[0].Type, actions[1].Type)
+	}
+	if actions[0].IdempotencyKey == actions[1].IdempotencyKey {
+		t.Fatal("delete and ban idempotency keys must differ")
+	}
+}
+
 func (s *recordingStore) RecordTerminal(_ context.Context, event events.TelegramUpdate, outcome Outcome) error {
 	s.event = event
 	s.outcome = outcome
@@ -246,8 +271,8 @@ func TestProcessorChecksProfileOfUserWhoAddsReaction(t *testing.T) {
 	if store.outcome.State != DecidedPendingAction {
 		t.Fatalf("terminal state = %q, want %q", store.outcome.State, DecidedPendingAction)
 	}
-	if store.outcome.Action == nil || store.outcome.Action.Type != ActionDeleteReaction {
-		t.Fatalf("action = %#v, want DELETE_REACTION", store.outcome.Action)
+	if !hasAction(store.outcome, ActionDeleteReaction) {
+		t.Fatalf("actions = %#v, want DELETE_REACTION", store.outcome.Actions)
 	}
 	profileSignal := signalByDetector(t, store.outcome, "profile.personal_channel")
 	if profileSignal.Score == nil || *profileSignal.Score < 0.9 {
@@ -279,8 +304,8 @@ func TestProcessorQueuesMessageDeletionAtHighRisk(t *testing.T) {
 	if store.outcome.State != DecidedPendingAction {
 		t.Fatalf("terminal state = %q, want %q", store.outcome.State, DecidedPendingAction)
 	}
-	if store.outcome.Action == nil || store.outcome.Action.Type != ActionDeleteMessage {
-		t.Fatalf("action = %#v, want DELETE_MESSAGE", store.outcome.Action)
+	if !hasAction(store.outcome, ActionDeleteMessage) {
+		t.Fatalf("actions = %#v, want DELETE_MESSAGE", store.outcome.Actions)
 	}
 }
 
@@ -307,8 +332,8 @@ func TestProcessorQueuesCompactJobPromotionDeletion(t *testing.T) {
 	if store.outcome.State != DecidedPendingAction {
 		t.Fatalf("terminal state = %q, want %q", store.outcome.State, DecidedPendingAction)
 	}
-	if store.outcome.Action == nil || store.outcome.Action.Type != ActionDeleteMessage {
-		t.Fatalf("action = %#v, want DELETE_MESSAGE", store.outcome.Action)
+	if !hasAction(store.outcome, ActionDeleteMessage) {
+		t.Fatalf("actions = %#v, want DELETE_MESSAGE", store.outcome.Actions)
 	}
 }
 
@@ -335,8 +360,8 @@ func TestProcessorQueuesExclusiveVPNPromotionDeletionWithBareDomain(t *testing.T
 	if store.outcome.State != DecidedPendingAction {
 		t.Fatalf("terminal state = %q, want %q", store.outcome.State, DecidedPendingAction)
 	}
-	if store.outcome.Action == nil || store.outcome.Action.Type != ActionDeleteMessage {
-		t.Fatalf("action = %#v, want DELETE_MESSAGE", store.outcome.Action)
+	if !hasAction(store.outcome, ActionDeleteMessage) {
+		t.Fatalf("actions = %#v, want DELETE_MESSAGE", store.outcome.Actions)
 	}
 }
 
@@ -391,7 +416,7 @@ func TestProcessorKeepsProtectedMemberForReview(t *testing.T) {
 	if err := processor.Process(context.Background(), event); err != nil {
 		t.Fatalf("Process() error = %v", err)
 	}
-	if store.outcome.State != ProcessedReview || store.outcome.Action != nil {
+	if store.outcome.State != ProcessedReview || len(store.outcome.Actions) != 0 {
 		t.Fatalf("outcome = %#v, want protected REVIEW", store.outcome)
 	}
 }

@@ -30,7 +30,7 @@ type Outcome struct {
 	State    TerminalState
 	Signals  []detection.Signal
 	Decision Decision
-	Action   *ActionRequest
+	Actions  []ActionRequest
 }
 
 // ActionRequest is persisted atomically with its decision and later executed
@@ -218,24 +218,40 @@ func (p *Processor) Process(ctx context.Context, event events.TelegramUpdate) er
 		AutobanDisabled:          autobanDisabled,
 	})
 	state := terminalStateFor(decision.AuthorizedAction)
-	var action *ActionRequest
+	actions := []ActionRequest{}
 	if isAutomaticAction(decision.AuthorizedAction) {
-		action = &ActionRequest{
-			Type:           decision.AuthorizedAction,
-			Target:         actionTarget,
-			IdempotencyKey: actionIdempotencyKey(event.EventID, decision.AuthorizedAction, actionTarget),
-		}
+		actions = actionRequestsFor(event.EventID, decision.AuthorizedAction, actionTarget)
 	}
 
 	if err := p.store.RecordTerminal(ctx, event, Outcome{
 		State:    state,
 		Signals:  signals,
 		Decision: decision,
-		Action:   action,
+		Actions:  actions,
 	}); err != nil {
 		return fmt.Errorf("record terminal moderation state: %w", err)
 	}
 	return nil
+}
+
+func actionRequestsFor(eventID string, action ActionType, target ActionTarget) []ActionRequest {
+	requests := []ActionRequest{}
+	appendAction := func(actionType ActionType) {
+		requests = append(requests, ActionRequest{
+			Type: actionType, Target: target,
+			IdempotencyKey: actionIdempotencyKey(eventID, actionType, target),
+		})
+	}
+	if action == ActionBanUser {
+		switch target.Kind {
+		case TargetMessage:
+			appendAction(ActionDeleteMessage)
+		case TargetReaction:
+			appendAction(ActionDeleteReaction)
+		}
+	}
+	appendAction(action)
+	return requests
 }
 
 func terminalStateFor(action ActionType) TerminalState {

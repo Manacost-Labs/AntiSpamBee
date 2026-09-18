@@ -82,7 +82,7 @@ func TestCommandRouterQueuesModeratorBan(t *testing.T) {
 	if err := router.Process(context.Background(), event); err != nil {
 		t.Fatal(err)
 	}
-	if store.outcome.Action == nil || store.outcome.Action.Type != ActionBanUser || store.outcome.Action.Target.UserID != 42 {
+	if !hasAction(store.outcome, ActionBanUser) || !hasAction(store.outcome, ActionDeleteMessage) {
 		t.Fatalf("outcome = %#v", store.outcome)
 	}
 }
@@ -114,7 +114,7 @@ func TestCommandRouterQueuesUnbanByUserID(t *testing.T) {
 	if err := router.Process(context.Background(), event); err != nil {
 		t.Fatal(err)
 	}
-	if store.outcome.Action == nil || store.outcome.Action.Type != ActionUnbanUser || store.outcome.Action.Target.UserID != 42 {
+	if !hasAction(store.outcome, ActionUnbanUser) {
 		t.Fatalf("outcome = %#v", store.outcome)
 	}
 }

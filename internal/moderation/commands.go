@@ -309,8 +309,17 @@ func (r *CommandRouter) recordCommand(ctx context.Context, event events.Telegram
 		decision.RecommendedAction = action.Type
 		decision.AuthorizedAction = action.Type
 	}
+	actions := []ActionRequest{}
+	if action != nil {
+		actions = actionRequestsFor(event.EventID, action.Type, action.Target)
+		for index := range actions {
+			if actions[index].Type == action.Type {
+				actions[index].UntilDate = action.UntilDate
+			}
+		}
+	}
 	return r.store.RecordTerminal(ctx, event, Outcome{
-		State: state, Signals: []detection.Signal{signal}, Decision: decision, Action: action,
+		State: state, Signals: []detection.Signal{signal}, Decision: decision, Actions: actions,
 	})
 }
 

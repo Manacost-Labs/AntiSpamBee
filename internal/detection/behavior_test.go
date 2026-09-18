@@ -18,10 +18,10 @@ func TestBehaviorDetectorFlagsFlood(t *testing.T) {
 	}
 }
 
-func TestBehaviorDetectorUsesPriorViolationsAsSupportingEvidence(t *testing.T) {
+func TestBehaviorDetectorBansRepeatViolator(t *testing.T) {
 	detector := NewBehaviorDetector()
 	signal := detector.Analyze(BehaviorStats{PreviousViolations: 2})
-	if signal.Score == nil || *signal.Score != 0.7 {
+	if signal.Score == nil || *signal.Score != 1 {
 		t.Fatalf("signal = %#v", signal)
 	}
 }

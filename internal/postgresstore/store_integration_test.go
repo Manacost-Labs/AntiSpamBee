@@ -59,13 +59,13 @@ func TestStoreRecordTerminalIsIdempotent(t *testing.T) {
 			AuthorizedAction:    moderation.ActionDeleteMessage,
 			AuthorizationReason: moderation.ReasonLikelyAdvertising,
 		},
-		Action: &moderation.ActionRequest{
+		Actions: []moderation.ActionRequest{{
 			Type: moderation.ActionDeleteMessage,
 			Target: moderation.ActionTarget{
 				Kind: moderation.TargetMessage, ChatID: -100777, UserID: 42, MessageID: 91,
 			},
 			IdempotencyKey: "delete-message:-100777:91:82373d0f-5740-5f07-b4e8-02c2f4edd824",
-		},
+		}},
 		Signals: []detection.Signal{
 			{
 				SchemaVersion:    "1",
@@ -234,8 +234,8 @@ func TestStoreRecordTerminalIsIdempotent(t *testing.T) {
 	outcome.Decision.RiskScore = 1
 	outcome.Decision.RecommendedAction = moderation.ActionBanUser
 	outcome.Decision.AuthorizedAction = moderation.ActionBanUser
-	outcome.Action.Type = moderation.ActionBanUser
-	outcome.Action.IdempotencyKey = "ban:-100777:42:82373d0f-5740-5f07-b4e8-02c2f4edd824"
+	outcome.Actions[0].Type = moderation.ActionBanUser
+	outcome.Actions[0].IdempotencyKey = "ban:-100777:42:82373d0f-5740-5f07-b4e8-02c2f4edd824"
 	if err := store.RecordTerminal(ctx, event, outcome); err != nil {
 		t.Fatalf("record changed replayed decision: %v", err)
 	}

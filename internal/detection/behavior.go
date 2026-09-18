@@ -30,17 +30,21 @@ func (d *BehaviorDetector) Analyze(stats BehaviorStats) Signal {
 	reasons := []string{}
 	rules := []string{}
 	if stats.PreviousViolations >= 2 {
-		score = 0.7
+		score = 1
 		reasons = append(reasons, ReasonPriorViolation)
 		rules = append(rules, "BEHAVIOR_REPUTATION_01")
 	}
 	if stats.DuplicateCount >= 3 {
-		score = 0.95
+		if score < 0.95 {
+			score = 0.95
+		}
 		reasons = appendUnique(reasons, ReasonDuplicateSpam)
 		rules = append(rules, "BEHAVIOR_DUPLICATE_01")
 	}
 	if stats.MessagesInWindow >= 5 {
-		score = 0.95
+		if score < 0.95 {
+			score = 0.95
+		}
 		reasons = appendUnique(reasons, ReasonFlood)
 		rules = append(rules, "BEHAVIOR_FLOOD_01")
 	}

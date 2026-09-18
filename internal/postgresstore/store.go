@@ -399,7 +399,7 @@ func (s *Store) RecordTerminal(
 	if outcome.Decision.AuthorizedAction == "" {
 		return fmt.Errorf("record moderation decision %q: authorized action is required", event.SourceKey)
 	}
-	if outcome.State == moderation.DecidedPendingAction && outcome.Action == nil {
+	if outcome.State == moderation.DecidedPendingAction && len(outcome.Actions) == 0 {
 		return fmt.Errorf("record moderation decision %q: pending state requires an action", event.SourceKey)
 	}
 	tx, err := s.pool.Begin(ctx)
@@ -517,8 +517,8 @@ func (s *Store) RecordTerminal(
 		return fmt.Errorf("insert moderation decision for event %q: %w", event.SourceKey, err)
 	}
 
-	if outcome.Action != nil {
-		if outcome.Action.IdempotencyKey == "" {
+	for _, action := range outcome.Actions {
+		if action.IdempotencyKey == "" {
 			return fmt.Errorf("insert moderation action for event %q: idempotency key is required", event.SourceKey)
 		}
 		_, err = tx.Exec(ctx, `
@@ -539,12 +539,12 @@ func (s *Store) RecordTerminal(
 			decisionID,
 			event.EventID,
 			event.TenantID,
-			outcome.Action.IdempotencyKey,
-			outcome.Action.Type,
-			outcome.Action.Target.ChatID,
-			outcome.Action.Target.UserID,
-			outcome.Action.Target.MessageID,
-			outcome.Action.UntilDate,
+			action.IdempotencyKey,
+			action.Type,
+			action.Target.ChatID,
+			action.Target.UserID,
+			action.Target.MessageID,
+			action.UntilDate,
 		)
 		if err != nil {
 			return fmt.Errorf("insert moderation action for event %q: %w", event.SourceKey, err)
