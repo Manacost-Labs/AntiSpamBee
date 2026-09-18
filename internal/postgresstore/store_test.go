@@ -1,6 +1,10 @@
 package postgresstore
 
-import "testing"
+import (
+	"testing"
+
+	"antispambee/internal/moderation"
+)
 
 func TestValidateCommunityPolicyLookupAllowsAnonymousSenderChat(t *testing.T) {
 	t.Parallel()
@@ -31,5 +35,16 @@ func TestValidateCommunityPolicyLookupRejectsInvalidTargets(t *testing.T) {
 				t.Fatal("validateCommunityPolicyLookup() error = nil, want validation error")
 			}
 		})
+	}
+}
+
+func TestNormalizeInputFeaturesProvidesDatabaseSafeDefaults(t *testing.T) {
+	got := normalizeInputFeatures(moderation.InputFeatures{})
+
+	if got.UpdateKind != "unknown" {
+		t.Fatalf("UpdateKind = %q, want unknown", got.UpdateKind)
+	}
+	if got.MediaTypes == nil || len(got.MediaTypes) != 0 {
+		t.Fatalf("MediaTypes = %#v, want non-nil empty slice", got.MediaTypes)
 	}
 }

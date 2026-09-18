@@ -3,6 +3,7 @@ package postgresstore
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -405,6 +406,7 @@ func (s *Store) RecordTerminal(
 	event events.TelegramUpdate,
 	outcome moderation.Outcome,
 ) error {
+	input := normalizeInputFeatures(outcome.Input)
 	if outcome.Decision.AuthorizedAction == "" {
 		return fmt.Errorf("record moderation decision %q: authorized action is required", event.SourceKey)
 	}
@@ -448,6 +450,17 @@ func (s *Store) RecordTerminal(
 	).Scan(&eventID)
 	if err != nil {
 		return fmt.Errorf("insert terminal moderation event %q: %w", event.SourceKey, err)
+	}
+	_, err = tx.Exec(ctx, `
+		INSERT INTO moderation_event_features (
+			event_id, update_kind, text_length, ocr_text_length, has_link, media_types, content_fingerprint
+		)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		ON CONFLICT (event_id) DO NOTHING
+	`, event.EventID, input.UpdateKind, input.TextLength, input.OCRTextLength, input.HasLink,
+		input.MediaTypes, input.ContentFingerprint)
+	if err != nil {
+		return fmt.Errorf("insert input features for event %q: %w", event.SourceKey, err)
 	}
 
 	if len(outcome.Signals) == 0 {
@@ -498,6 +511,7 @@ func (s *Store) RecordTerminal(
 	}
 
 	var decisionID string
+	decisionInserted := true
 	err = tx.QueryRow(ctx, `
 		INSERT INTO moderation_decisions (
 			decision_id,
@@ -510,8 +524,7 @@ func (s *Store) RecordTerminal(
 			authorization_reason
 		)
 		VALUES ($1, $1, $2, $3, $4, $5, $6, $7)
-		ON CONFLICT (event_id) DO UPDATE
-		SET event_id = EXCLUDED.event_id
+		ON CONFLICT (event_id) DO NOTHING
 		RETURNING decision_id::text
 	`,
 		event.EventID,
@@ -522,11 +535,20 @@ func (s *Store) RecordTerminal(
 		outcome.Decision.AuthorizedAction,
 		outcome.Decision.AuthorizationReason,
 	).Scan(&decisionID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		decisionInserted = false
+		err = tx.QueryRow(ctx, `
+			SELECT decision_id::text FROM moderation_decisions WHERE event_id = $1
+		`, event.EventID).Scan(&decisionID)
+	}
 	if err != nil {
 		return fmt.Errorf("insert moderation decision for event %q: %w", event.SourceKey, err)
 	}
 
 	for _, action := range outcome.Actions {
+		if !decisionInserted {
+			break
+		}
 		if action.IdempotencyKey == "" {
 			return fmt.Errorf("insert moderation action for event %q: idempotency key is required", event.SourceKey)
 		}
@@ -584,4 +606,14 @@ func (s *Store) RecordTerminal(
 		return fmt.Errorf("commit terminal moderation event %q: %w", event.SourceKey, err)
 	}
 	return nil
+}
+
+func normalizeInputFeatures(input moderation.InputFeatures) moderation.InputFeatures {
+	if input.UpdateKind == "" {
+		input.UpdateKind = "unknown"
+	}
+	if input.MediaTypes == nil {
+		input.MediaTypes = []string{}
+	}
+	return input
 }

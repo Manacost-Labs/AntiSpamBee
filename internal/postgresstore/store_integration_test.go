@@ -26,7 +26,7 @@ func TestStoreRecordTerminalIsIdempotent(t *testing.T) {
 	}
 	t.Cleanup(pool.Close)
 
-	if _, err := pool.Exec(ctx, "TRUNCATE user_reports, moderation_allowlist, community_policies, message_activity, moderation_audit_log, moderation_actions, moderation_decisions, detector_signals, moderation_events"); err != nil {
+	if _, err := pool.Exec(ctx, "TRUNCATE user_reports, moderation_allowlist, community_policies, message_activity, moderation_audit_log, moderation_actions, moderation_decisions, detector_signals, moderation_event_features, moderation_events"); err != nil {
 		t.Fatalf("truncate moderation_events: %v", err)
 	}
 
@@ -51,6 +51,14 @@ func TestStoreRecordTerminalIsIdempotent(t *testing.T) {
 	confidence := 0.95
 	outcome := moderation.Outcome{
 		State: moderation.DecidedPendingAction,
+		Input: moderation.InputFeatures{
+			UpdateKind:         "message",
+			TextLength:         37,
+			OCRTextLength:      12,
+			HasLink:            true,
+			MediaTypes:         []string{"photo"},
+			ContentFingerprint: "privacy-safe-fingerprint",
+		},
 		Decision: moderation.Decision{
 			RiskScore:           0.95,
 			DecisionConfidence:  0.95,
@@ -141,6 +149,23 @@ func TestStoreRecordTerminalIsIdempotent(t *testing.T) {
 	}
 	if state != string(moderation.DecidedPendingAction) {
 		t.Errorf("terminal state = %q, want %q", state, moderation.DecidedPendingAction)
+	}
+	var (
+		updateKind    string
+		textLength    int
+		ocrTextLength int
+		hasLink       bool
+		mediaTypes    []string
+		fingerprint   string
+	)
+	if err := pool.QueryRow(ctx, `
+		SELECT update_kind, text_length, ocr_text_length, has_link, media_types, content_fingerprint
+		FROM moderation_event_features WHERE event_id = $1
+	`, event.EventID).Scan(&updateKind, &textLength, &ocrTextLength, &hasLink, &mediaTypes, &fingerprint); err != nil {
+		t.Fatalf("query moderation event features: %v", err)
+	}
+	if updateKind != "message" || textLength != 37 || ocrTextLength != 12 || !hasLink || len(mediaTypes) != 1 || mediaTypes[0] != "photo" || fingerprint != "privacy-safe-fingerprint" {
+		t.Fatalf("stored input features = %q/%d/%d/%v/%v/%q", updateKind, textLength, ocrTextLength, hasLink, mediaTypes, fingerprint)
 	}
 
 	var (
