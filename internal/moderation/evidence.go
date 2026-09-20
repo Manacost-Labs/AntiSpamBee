@@ -2,22 +2,35 @@ package moderation
 
 import (
 	"antispambee/internal/detection"
+	"crypto/sha256"
+	"encoding/binary"
 	"time"
 )
 
 // Evidence preserves the inputs and policy behind an actionable/review decision.
 // It deliberately excludes the raw Telegram envelope and expires after 30 days.
 type Evidence struct {
-	AuthorUsername string
-	Version        string
-	Target         ActionTarget
-	Message        detection.MessageContent
-	Profile        detection.Profile
-	Signals        []detection.Signal
-	Decision       Decision
-	Policy         CommunityPolicy
-	Protected      bool
-	Truncated      bool
+	AuthorUsername   string
+	Version          string
+	Target           ActionTarget
+	Message          detection.MessageContent
+	Profile          detection.Profile
+	Signals          []detection.Signal
+	Decision         Decision
+	Policy           CommunityPolicy
+	Protected        bool
+	Truncated        bool
+	EvaluationSample bool
+}
+
+// Independent of the detector outcome: sampling only deleted messages cannot
+// reveal missed spam. Stable across redelivery, approximately 5% of messages.
+func evaluationSample(tenantID, eventID string) bool {
+	if eventID == "" {
+		return false
+	}
+	hash := sha256.Sum256([]byte(tenantID + "\x00" + eventID))
+	return binary.BigEndian.Uint32(hash[:4]) < uint32((uint64(1)<<32)/20)
 }
 
 func newEvidence(target ActionTarget, message detection.MessageContent, profile detection.Profile, signals []detection.Signal, decision Decision, policy CommunityPolicy, protected bool) *Evidence {

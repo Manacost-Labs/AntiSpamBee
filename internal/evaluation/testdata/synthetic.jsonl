@@ -1,0 +1,16 @@
+{"id":"s1","label":"spam","split":"test","campaign":"job1","source":"synthetic","evidence":{"Message":{"Text":"Ищем сотрудников, удаленная работа, 5000 рублей в день, пишите в лс"}}}
+{"id":"h1","label":"ham","split":"test","campaign":"job1","source":"synthetic","evidence":{"Message":{"Text":"Осторожно, мошенники! Ищем сотрудников, удаленная работа, 5000 рублей в день, пишите в лс"}}}
+{"id":"h2","label":"ham","split":"test","campaign":"job1","source":"synthetic","evidence":{"Message":{"Text":"Мне прислали: «Ищем сотрудников, удаленная работа, 5000 рублей в день, пишите в лс». Это спам?"}}}
+{"id":"s2","label":"spam","split":"test","campaign":"vpn1","source":"synthetic","evidence":{"Message":{"Text":"Бесплатный VPN, подключайся https://example.com"}}}
+{"id":"h3","label":"ham","split":"test","campaign":"vpn1","source":"synthetic","evidence":{"Message":{"Text":"Не переходите по ссылке: бесплатный VPN, подключайся https://example.com"}}}
+{"id":"h4","label":"ham","split":"test","campaign":"normal1","source":"synthetic","evidence":{"Message":{"Text":"Привет! Кто сегодня играет?"}}}
+{"id":"h5","label":"ham","split":"test","campaign":"normal2","source":"synthetic","evidence":{"Message":{"Text":"Какая колода лучше после патча? https://example.com/deck"}}}
+{"id":"h6","label":"ham","split":"test","campaign":"normal3","source":"synthetic","evidence":{"Message":{"Text":"VPN перестал работать, у кого ещё такая проблема?"}}}
+{"id":"h7","label":"ham","split":"test","campaign":"normal4","source":"synthetic","evidence":{"Message":{"Text":"Сколько стоит подписка на игру?"}}}
+{"id":"s3","label":"spam","split":"test","campaign":"job2","source":"synthetic","evidence":{"Message":{"Text":"Ищем сотрудников, удаленная работа, высокий доход, пишите в личку"}}}
+{"id":"s4","label":"spam","split":"test","campaign":"job2","source":"synthetic","evidence":{"Message":{"Text":"Ищем сoтрудников, удаленная рабoта, высокий доход, пишите в личку"}}}
+{"id":"s5","label":"spam","split":"test","campaign":"job2","source":"synthetic","evidence":{"Message":{"Text":"Ищем сотру​дников, удаленная работа, высокий доход, пишите в личку"}}}
+{"id":"s6","label":"spam","split":"test","campaign":"ocr1","source":"synthetic","evidence":{"Message":{"OCRText":"Ищем сотрудников, удаленная работа, 5000 рублей в день, пишите в лс"}}}
+{"id":"h8","label":"ham","split":"test","campaign":"empty1","source":"synthetic","evidence":{"Message":{}}}
+{"id":"h9","label":"ham","split":"test","campaign":"normal5","source":"synthetic","evidence":{"Message":{"Text":"Есть работающий способ победить этого босса?"}}}
+{"id":"u1","label":"uncertain","split":"test","campaign":"unclear1","source":"synthetic","evidence":{"Message":{"Text":"Продаю свой аккаунт, кому интересно?"}}}

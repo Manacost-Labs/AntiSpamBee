@@ -6,4 +6,5 @@ coverage.out
 *.test
 assets
 backups
+data/evaluation-private
 .env.*

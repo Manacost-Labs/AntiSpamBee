@@ -17,6 +17,16 @@ func assertDurableEvidenceAndOutbox(t *testing.T, ctx context.Context, pool *pgx
 	if history, err := store.ListModerationHistory(ctx, "00000000-0000-4000-8000-000000000999", -100777); err != nil || len(history) != 0 {
 		t.Fatalf("tenant isolation failed: %v %v", history, err)
 	}
+	// Evaluation samples must not displace actual moderation cases in /history.
+	if _, err := pool.Exec(ctx, `UPDATE moderation_evidence SET snapshot=jsonb_set(snapshot,'{Decision,AuthorizedAction}','"ALLOW"') WHERE event_id=$1`, event.EventID); err != nil {
+		t.Fatal(err)
+	}
+	if history, err := store.ListModerationHistory(ctx, event.TenantID, -100777); err != nil || len(history) != 0 {
+		t.Fatalf("allowed sample in history: %v %v", history, err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE moderation_evidence SET snapshot=jsonb_set(snapshot,'{Decision,AuthorizedAction}','"DELETE_MESSAGE"') WHERE event_id=$1`, event.EventID); err != nil {
+		t.Fatal(err)
+	}
 	n, found, err := store.ClaimNotification(ctx, "notify-1", time.Second)
 	if err != nil || !found || n.Payload.Message != "Подключай VPN со скидкой" {
 		t.Fatalf("outbox after completion: %+v %v %v", n, found, err)

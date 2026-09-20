@@ -76,7 +76,9 @@ func (s *Store) ListModerationHistory(ctx context.Context, tenantID string, chat
 	}
 	rows, err := s.pool.Query(ctx, `SELECT e.event_id::text,e.created_at,e.snapshot,
 		COALESCE((SELECT string_agg(a.action_type || ': ' || a.status, ', ' ORDER BY a.action_type) FROM moderation_actions a WHERE a.event_id=e.event_id),'REVIEW')
-		FROM moderation_evidence e WHERE e.tenant_id=$1 AND e.chat_id=$2 AND e.expires_at>now() ORDER BY e.created_at DESC,e.event_id LIMIT 5`, tenantID, chatID)
+		FROM moderation_evidence e WHERE e.tenant_id=$1 AND e.chat_id=$2 AND e.expires_at>now()
+		AND COALESCE(e.snapshot->'Decision'->>'AuthorizedAction','') <> 'ALLOW'
+		ORDER BY e.created_at DESC,e.event_id LIMIT 5`, tenantID, chatID)
 	if err != nil {
 		return nil, err
 	}

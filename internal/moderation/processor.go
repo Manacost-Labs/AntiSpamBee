@@ -294,9 +294,11 @@ func (p *Processor) Process(ctx context.Context, event events.TelegramUpdate) er
 	}
 
 	var evidence *Evidence
-	if decision.AuthorizedAction != ActionAllow {
+	sampled := actionTarget.Kind == TargetMessage && evaluationSample(event.TenantID, event.EventID)
+	if decision.AuthorizedAction != ActionAllow || sampled {
 		evidence = newEvidence(actionTarget, message, profileContext, signals, decision, policy, isProtected)
 		evidence.AuthorUsername = messageAuthorUsername(event.Payload)
+		evidence.EvaluationSample = sampled
 	}
 	if err := p.store.RecordTerminal(ctx, event, Outcome{
 		State:    state,
