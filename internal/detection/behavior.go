@@ -43,8 +43,8 @@ func (d *BehaviorDetector) Analyze(stats BehaviorStats) Signal {
 		rules = append(rules, "BEHAVIOR_DUPLICATE_01")
 	}
 	if stats.MessagesInWindow >= 5 {
-		if score < 0.95 {
-			score = 0.95
+		if score < 0.5 {
+			score = 0.5
 		}
 		reasons = appendUnique(reasons, ReasonFlood)
 		rules = append(rules, "BEHAVIOR_FLOOD_01")
@@ -53,7 +53,7 @@ func (d *BehaviorDetector) Analyze(stats BehaviorStats) Signal {
 	return Signal{
 		SchemaVersion:    "1",
 		Detector:         "behavior.spam",
-		DetectorVersion:  "behavior-v1",
+		DetectorVersion:  "behavior-v2",
 		Category:         "spam.behavior",
 		Status:           StatusAvailable,
 		Score:            &score,
@@ -63,5 +63,6 @@ func (d *BehaviorDetector) Analyze(stats BehaviorStats) Signal {
 		ReasonCodes:      reasons,
 		MatchedRules:     rules,
 		CreatedAt:        d.now().UTC(),
+		Activity:         &stats,
 	}
 }

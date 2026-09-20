@@ -40,7 +40,7 @@ const (
 	ReasonCertainAdvertising       = "CERTAIN_ADVERTISING"
 	ReasonLikelyAdvertising        = "LIKELY_ADVERTISING"
 	ReasonMessageEvidenceRequired  = "CURRENT_MESSAGE_EVIDENCE_REQUIRED"
-	DecisionPolicyVersion          = "message-evidence-v2"
+	DecisionPolicyVersion          = "message-evidence-v3"
 )
 
 // ActionTarget contains stable Telegram identifiers needed by an action worker.

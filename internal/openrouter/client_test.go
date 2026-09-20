@@ -33,7 +33,7 @@ func TestClientAnalyzeAdvertisingUsesDecisionsAPI(t *testing.T) {
 		if request.State["message_text"] != "Казино: бонус за депозит" {
 			t.Errorf("state = %#v", request.State)
 		}
-		for _, question := range []string{"is_prohibited_ad", "ad_category", "evidence_strength"} {
+		for _, question := range []string{"is_prohibited_ad", "ad_category", "evidence_strength", "evidence_passage"} {
 			if _, ok := request.Questions[question]; !ok {
 				t.Errorf("question %q missing", question)
 			}
@@ -46,7 +46,8 @@ func TestClientAnalyzeAdvertisingUsesDecisionsAPI(t *testing.T) {
 			"answers":{
 				"is_prohibited_ad":{"type":"noul","noul":0.97},
 				"ad_category":{"type":"choice","choice":"gambling","probabilities":{"gambling":0.94,"none":0.06},"confidence":0.91},
-				"evidence_strength":{"type":"score","score":1.9,"confidence":0.88,"probabilities":{"0":0.01,"1":0.08,"2":0.91},"legend":{"0":"insufficient","1":"ambiguous","2":"strong"}}
+				"evidence_passage":{"type":"choice","choice":"p0","confidence":0.95},
+				"evidence_strength":{"type":"score","score":1.9,"confidence":0.95,"probabilities":{"0":0.01,"1":0.08,"2":0.91},"legend":{"0":"insufficient","1":"ambiguous","2":"strong"}}
 			},
 			"usage":{"input_tokens":120,"output_tokens":20,"cost":0.000005}
 		}`))

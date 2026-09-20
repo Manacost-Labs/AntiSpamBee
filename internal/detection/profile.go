@@ -28,20 +28,24 @@ const (
 
 // Signal is the versioned output shared by detection rules.
 type Signal struct {
-	SchemaVersion    string
-	Detector         string
-	DetectorVersion  string
-	Category         string
-	Status           SignalStatus
-	Score            *float64
-	Confidence       *float64
-	Severity         Severity
-	EvidenceCoverage float64
-	ReasonCodes      []string
-	MatchedRules     []string
-	CreatedAt        time.Time
-	ConfiguredModel  string
-	ResolvedModel    string
+	SchemaVersion      string
+	Detector           string
+	DetectorVersion    string
+	Category           string
+	Status             SignalStatus
+	Score              *float64
+	Confidence         *float64
+	Severity           Severity
+	EvidenceCoverage   float64
+	ReasonCodes        []string
+	MatchedRules       []string
+	CreatedAt          time.Time
+	ConfiguredModel    string
+	ResolvedModel      string
+	EvidenceStrength   *float64
+	EvidenceConfidence *float64
+	EvidenceExcerpt    string
+	Activity           *BehaviorStats
 }
 
 // Profile contains optional Telegram profile context.

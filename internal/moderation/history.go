@@ -63,6 +63,9 @@ func (r *CommandRouter) handleHistory(ctx context.Context, event events.Telegram
 		for _, s := range e.Signals {
 			if s.Score != nil && *s.Score >= .5 {
 				fmt.Fprintf(&b, "%s: %.2f %s\n", s.Detector, *s.Score, boundedHistoryText(strings.Join(s.ReasonCodes, ","), 160))
+				if s.EvidenceExcerpt != "" {
+					fmt.Fprintf(&b, "Фрагмент, выбранный моделью: %s\n", boundedHistoryText(s.EvidenceExcerpt, 200))
+				}
 			}
 		}
 		fmt.Fprintf(&b, "%s\n", boundedHistoryText(text, 350))

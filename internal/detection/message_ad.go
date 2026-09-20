@@ -48,7 +48,7 @@ func (d *MessageAdDetector) Analyze(content MessageContent) Signal {
 	base := Signal{
 		SchemaVersion:   "1",
 		Detector:        "message.commercial_promotion",
-		DetectorVersion: "message-ad-v2",
+		DetectorVersion: "message-ad-v3",
 		Category:        "spam.advertising",
 		ReasonCodes:     []string{},
 		MatchedRules:    []string{},
@@ -79,6 +79,15 @@ func (d *MessageAdDetector) Analyze(content MessageContent) Signal {
 	base.Severity = severityFor(score)
 	base.ReasonCodes = reasons
 	base.MatchedRules = rules
+	if score >= .9 && containsAny(normalize(combined),
+		"осторожно мошенники", "это мошенники", "это мошенничество", "это спам",
+		"не переходите по ссылке", "не переходи по ссылке", "мне прислали", "пример спама",
+		"beware of scammers", "this is a scam", "do not click", "spam example") {
+		// Context is ambiguous, not proven benign: retain the risk for review.
+		// A separate semantic detector may still find active promotion.
+		base.EvidenceCoverage = 0
+		base.ReasonCodes = appendUnique(base.ReasonCodes, "POSSIBLE_QUOTATION_OR_WARNING")
+	}
 	return base
 }
 

@@ -13,7 +13,7 @@ func TestBehaviorDetectorFlagsDuplicateSpam(t *testing.T) {
 func TestBehaviorDetectorFlagsFlood(t *testing.T) {
 	detector := NewBehaviorDetector()
 	signal := detector.Analyze(BehaviorStats{MessagesInWindow: 5})
-	if signal.Score == nil || *signal.Score < 0.9 || !containsString(signal.ReasonCodes, ReasonFlood) {
+	if signal.Score == nil || *signal.Score != 0.5 || !containsString(signal.ReasonCodes, ReasonFlood) {
 		t.Fatalf("signal = %#v", signal)
 	}
 }

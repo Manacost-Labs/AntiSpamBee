@@ -12,7 +12,7 @@ func TestSemanticStateNeverUsesProfileAsMessageEvidence(t *testing.T) {
 		t.Fatalf("profile became evidence: %v %v", state, coverage)
 	}
 	state, _ = semanticState(detection.SemanticAdContent{Profile: profile, Message: detection.MessageContent{Text: "Привет"}})
-	if len(state) != 2 || state["message_text"] != "Привет" {
+	if len(state) != 3 || state["message_text"] != "Привет" {
 		t.Fatalf("profile leaked into message analysis: %v", state)
 	}
 }
