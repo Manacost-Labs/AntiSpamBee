@@ -6,16 +6,17 @@ import (
 	"antispambee/internal/detection"
 )
 
-func TestDecisionEngineBansOnlyAtCertainRisk(t *testing.T) {
+func TestDecisionEngineHighRuleScoreDeletesWithoutBan(t *testing.T) {
 	engine := NewDecisionEngine()
 
 	decision := engine.Decide(DecisionInput{
-		Target:  ActionTarget{Kind: TargetMessage, ChatID: -1001, UserID: 42, MessageID: 7},
-		Signals: []detection.Signal{availableSignal("message.rules", 1, 0.95, 1)},
+		HasMessageContent: true,
+		Target:            ActionTarget{Kind: TargetMessage, ChatID: -1001, UserID: 42, MessageID: 7},
+		Signals:           []detection.Signal{availableSignal("message.rules", 1, 0.95, 1)},
 	})
 
-	if decision.RecommendedAction != ActionBanUser || decision.AuthorizedAction != ActionBanUser {
-		t.Fatalf("actions = %q/%q, want BAN_USER", decision.RecommendedAction, decision.AuthorizedAction)
+	if decision.RecommendedAction != ActionDeleteMessage || decision.AuthorizedAction != ActionDeleteMessage {
+		t.Fatalf("actions = %q/%q, want DELETE_MESSAGE", decision.RecommendedAction, decision.AuthorizedAction)
 	}
 }
 
@@ -23,8 +24,9 @@ func TestDecisionEngineDeletesMessageAtNinetyPercent(t *testing.T) {
 	engine := NewDecisionEngine()
 
 	decision := engine.Decide(DecisionInput{
-		Target:  ActionTarget{Kind: TargetMessage, ChatID: -1001, UserID: 42, MessageID: 7},
-		Signals: []detection.Signal{availableSignal("message.rules", 0.90, 0.92, 1)},
+		HasMessageContent: true,
+		Target:            ActionTarget{Kind: TargetMessage, ChatID: -1001, UserID: 42, MessageID: 7},
+		Signals:           []detection.Signal{availableSignal("message.rules", 0.90, 0.92, 1)},
 	})
 
 	if decision.AuthorizedAction != ActionDeleteMessage {
@@ -32,7 +34,7 @@ func TestDecisionEngineDeletesMessageAtNinetyPercent(t *testing.T) {
 	}
 }
 
-func TestDecisionEngineDeletesReactionAtNinetyPercent(t *testing.T) {
+func TestDecisionEngineReviewsReactionWithSuspiciousProfile(t *testing.T) {
 	engine := NewDecisionEngine()
 
 	decision := engine.Decide(DecisionInput{
@@ -40,8 +42,8 @@ func TestDecisionEngineDeletesReactionAtNinetyPercent(t *testing.T) {
 		Signals: []detection.Signal{availableSignal("profile.rules", 0.95, 0.95, 1)},
 	})
 
-	if decision.AuthorizedAction != ActionDeleteReaction {
-		t.Fatalf("authorized action = %q, want DELETE_REACTION", decision.AuthorizedAction)
+	if decision.AuthorizedAction != ActionReview {
+		t.Fatalf("authorized action = %q, want REVIEW", decision.AuthorizedAction)
 	}
 }
 
@@ -49,8 +51,9 @@ func TestDecisionEngineUsesHighConfidenceModelForDeleteOnly(t *testing.T) {
 	engine := NewDecisionEngine()
 
 	decision := engine.Decide(DecisionInput{
-		Target:  ActionTarget{Kind: TargetMessage, ChatID: -1001, UserID: 42, MessageID: 7},
-		Signals: []detection.Signal{availableSignal("model.jev_advertising", 1, 0.98, 1)},
+		HasMessageContent: true,
+		Target:            ActionTarget{Kind: TargetMessage, ChatID: -1001, UserID: 42, MessageID: 7},
+		Signals:           []detection.Signal{availableSignal("model.jev_advertising", 1, 0.98, 1)},
 	})
 
 	if decision.AuthorizedAction != ActionDeleteMessage || decision.RiskScore >= 1 {
@@ -58,17 +61,18 @@ func TestDecisionEngineUsesHighConfidenceModelForDeleteOnly(t *testing.T) {
 	}
 }
 
-func TestDecisionEngineBansWhenIndependentSignalsCorroborate(t *testing.T) {
+func TestDecisionEngineDoesNotTreatCorrelatedSignalsAsCertainty(t *testing.T) {
 	engine := NewDecisionEngine()
 	decision := engine.Decide(DecisionInput{
-		Target: ActionTarget{Kind: TargetMessage, ChatID: -1001, UserID: 42, MessageID: 7},
+		HasMessageContent: true,
+		Target:            ActionTarget{Kind: TargetMessage, ChatID: -1001, UserID: 42, MessageID: 7},
 		Signals: []detection.Signal{
 			availableSignal("message.rules", 0.95, 0.95, 1),
 			availableSignal("model.jev_advertising", 0.96, 0.96, 1),
 		},
 	})
-	if decision.AuthorizedAction != ActionBanUser || decision.RiskScore != 1 {
-		t.Fatalf("decision = %#v, want corroborated BAN_USER", decision)
+	if decision.AuthorizedAction != ActionDeleteMessage || decision.RiskScore != .96 {
+		t.Fatalf("decision = %#v, want delete without synthetic certainty", decision)
 	}
 }
 
@@ -126,11 +130,12 @@ func TestDecisionEngineRespectsDisabledAutomaticActions(t *testing.T) {
 func TestDecisionEngineDowngradesBanWhenAutobanDisabled(t *testing.T) {
 	engine := NewDecisionEngine()
 	decision := engine.Decide(DecisionInput{
-		Target:          ActionTarget{Kind: TargetMessage, ChatID: -1001, UserID: 42, MessageID: 7},
-		AutobanDisabled: true,
-		Signals:         []detection.Signal{availableSignal("message.rules", 1, 1, 1)},
+		HasMessageContent: true,
+		Target:            ActionTarget{Kind: TargetMessage, ChatID: -1001, UserID: 42, MessageID: 7},
+		AutobanDisabled:   true,
+		Signals:           []detection.Signal{availableSignal("message.rules", 1, 1, 1)},
 	})
-	if decision.RecommendedAction != ActionBanUser || decision.AuthorizedAction != ActionDeleteMessage || decision.AuthorizationReason != ReasonAutobanDisabled {
+	if decision.RecommendedAction != ActionDeleteMessage || decision.AuthorizedAction != ActionDeleteMessage {
 		t.Fatalf("decision = %#v", decision)
 	}
 }

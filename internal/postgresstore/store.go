@@ -185,6 +185,18 @@ func (s *Store) finishAction(
 	if command.RowsAffected() != 1 {
 		return fmt.Errorf("complete moderation action: lease no longer owned")
 	}
+	// The outbox is committed with successful deletion, before the in-memory
+	// payload can be lost. Repeated completions cannot enqueue duplicates.
+	if action.Type == moderation.ActionDeleteMessage && (actionStatus == "SUCCEEDED" || actionStatus == "SUCCEEDED_ASSUMED") && action.Notification.ChatID > 0 {
+		payload, err := json.Marshal(action.Notification)
+		if err != nil {
+			return fmt.Errorf("encode deletion notification: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO moderation_notification_outbox(action_id, tenant_id, community_chat_id, payload)
+			VALUES ($1,$2,$3,$4) ON CONFLICT (action_id) DO NOTHING`, action.ActionID, action.TenantID, action.Target.ChatID, payload); err != nil {
+			return fmt.Errorf("enqueue deletion notification: %w", err)
+		}
+	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE moderation_events SET terminal_state = $2, processed_at = now()
 		WHERE event_id = $1
@@ -274,6 +286,9 @@ func (s *Store) ObserveMessage(
 			AND activity.chat_id = $2
 			AND activity.user_id = $3
 			AND decision.risk_score >= 0.90
+			AND decision.authorized_action = 'DELETE_MESSAGE'
+			AND event.created_at >= now() - interval '7 days'
+			AND EXISTS (SELECT 1 FROM moderation_actions a WHERE a.event_id = event.event_id AND a.action_type = 'DELETE_MESSAGE' AND a.status = 'SUCCEEDED')
 			AND event.event_id <> $4
 	`, event.TenantID, target.ChatID, target.UserID, event.EventID).Scan(&stats.PreviousViolations); err != nil {
 		return detection.BehaviorStats{}, fmt.Errorf("query prior moderation violations: %w", err)
@@ -668,6 +683,24 @@ func (s *Store) RecordTerminal(
 	}
 	if err != nil {
 		return fmt.Errorf("insert moderation decision for event %q: %w", event.SourceKey, err)
+	}
+	if decisionInserted {
+		if _, err := tx.Exec(ctx, `UPDATE moderation_decisions SET decision_version=$2 WHERE decision_id=$1`, decisionID, moderation.DecisionPolicyVersion); err != nil {
+			return err
+		}
+		if outcome.Evidence != nil {
+			snapshot, err := json.Marshal(outcome.Evidence)
+			if err != nil {
+				return fmt.Errorf("encode moderation evidence: %w", err)
+			}
+			if len(snapshot) > 1<<20 {
+				return fmt.Errorf("moderation evidence exceeds limit")
+			}
+			if _, err := tx.Exec(ctx, `INSERT INTO moderation_evidence(event_id,tenant_id,chat_id,message_id,snapshot)
+				VALUES ($1,$2,$3,$4,$5) ON CONFLICT (event_id) DO NOTHING`, event.EventID, event.TenantID, outcome.Evidence.Target.ChatID, outcome.Evidence.Target.MessageID, snapshot); err != nil {
+				return fmt.Errorf("persist moderation evidence: %w", err)
+			}
+		}
 	}
 
 	for _, action := range outcome.Actions {

@@ -31,6 +31,10 @@ type Repository interface {
 	MarkActionSucceeded(context.Context, moderation.ClaimedAction, bool) error
 	MarkActionRetryable(context.Context, moderation.ClaimedAction, time.Time, string) error
 	MarkActionPermanentFailure(context.Context, moderation.ClaimedAction, string) error
+	ClaimNotification(context.Context, string, time.Duration) (moderation.ClaimedNotification, bool, error)
+	FinishNotification(context.Context, moderation.ClaimedNotification, string, time.Time, string) error
+	NotificationRecipientCurrent(context.Context, moderation.ClaimedNotification) (bool, error)
+	PurgeExpiredEvidence(context.Context) error
 }
 
 // TelegramClient is the least Telegram authority required by the worker.
@@ -51,6 +55,7 @@ type Worker struct {
 	owner      string
 	lease      time.Duration
 	now        func() time.Time
+	nextPurge  time.Time
 }
 
 func New(repository Repository, telegram TelegramClient, owner string) (*Worker, error) {
@@ -74,6 +79,18 @@ func New(repository Repository, telegram TelegramClient, owner string) (*Worker,
 
 // RunOnce returns false when no due action was available.
 func (w *Worker) RunOnce(ctx context.Context) (bool, error) {
+	if !w.now().Before(w.nextPurge) {
+		if err := w.repository.PurgeExpiredEvidence(ctx); err != nil {
+			return false, err
+		}
+		w.nextPurge = w.now().Add(time.Minute)
+	}
+	worked, actionErr := w.runActionOnce(ctx)
+	notified, notificationErr := w.runNotificationOnce(ctx)
+	return worked || notified, errors.Join(actionErr, notificationErr)
+}
+
+func (w *Worker) runActionOnce(ctx context.Context) (bool, error) {
 	action, found, err := w.repository.ClaimAction(ctx, w.owner, w.lease)
 	if err != nil || !found {
 		return false, err
@@ -83,9 +100,6 @@ func (w *Worker) RunOnce(ctx context.Context) (bool, error) {
 	if err == nil {
 		if err := w.repository.MarkActionSucceeded(ctx, action, assumed); err != nil {
 			return true, fmt.Errorf("mark moderation action succeeded: %w", err)
-		}
-		if action.Type == moderation.ActionDeleteMessage {
-			w.notifyDeletedMessage(ctx, action.Notification)
 		}
 		if action.Type == moderation.ActionBanUser {
 			message := fmt.Sprintf("⛔ Пользователь %d заблокирован модерацией AntiSpamBee.", action.Target.UserID)
@@ -115,16 +129,6 @@ func (w *Worker) RunOnce(ctx context.Context) (bool, error) {
 		return true, fmt.Errorf("mark moderation action retryable: %w", err)
 	}
 	return true, nil
-}
-
-func (w *Worker) notifyDeletedMessage(ctx context.Context, notification moderation.DeletionNotification) {
-	message := formatDeletionNotification(notification)
-	if message == "" {
-		return
-	}
-	if err := w.telegram.SendMessage(ctx, notification.ChatID, message); err != nil {
-		slog.Warn("send deleted-message notification failed", "chat_id", notification.ChatID, "error", err)
-	}
 }
 
 func formatDeletionNotification(notification moderation.DeletionNotification) string {

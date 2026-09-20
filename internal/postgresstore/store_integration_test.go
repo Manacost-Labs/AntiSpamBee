@@ -26,7 +26,7 @@ func TestStoreRecordTerminalIsIdempotent(t *testing.T) {
 	}
 	t.Cleanup(pool.Close)
 
-	if _, err := pool.Exec(ctx, "TRUNCATE user_reports, moderation_allowlist, community_policies, message_activity, moderation_audit_log, moderation_actions, moderation_decisions, detector_signals, moderation_event_features, moderation_events"); err != nil {
+	if _, err := pool.Exec(ctx, "TRUNCATE moderation_evidence, moderation_notification_outbox, user_reports, moderation_allowlist, community_policies, message_activity, moderation_audit_log, moderation_actions, moderation_decisions, detector_signals, moderation_event_features, moderation_events"); err != nil {
 		t.Fatalf("truncate moderation_events: %v", err)
 	}
 
@@ -125,6 +125,7 @@ func TestStoreRecordTerminalIsIdempotent(t *testing.T) {
 			},
 		},
 	}
+	outcome.Evidence = &moderation.Evidence{Version: moderation.DecisionPolicyVersion, Target: outcome.Actions[0].Target, Message: detection.MessageContent{Text: "Подключай VPN со скидкой"}, Decision: outcome.Decision, Signals: outcome.Signals}
 	if err := store.RecordTerminal(ctx, event, outcome); err != nil {
 		t.Fatalf("record terminal event: %v", err)
 	}
@@ -264,6 +265,7 @@ func TestStoreRecordTerminalIsIdempotent(t *testing.T) {
 	if notificationMessage != "" {
 		t.Fatalf("notification message remains after action completion: %q", notificationMessage)
 	}
+	assertDurableEvidenceAndOutbox(t, ctx, pool, store, event)
 	if err := store.RecordTerminal(ctx, event, outcome); err != nil {
 		t.Fatalf("record event replay after completed action: %v", err)
 	}

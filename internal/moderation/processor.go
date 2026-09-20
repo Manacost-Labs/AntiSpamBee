@@ -36,6 +36,7 @@ type Outcome struct {
 	Signals  []detection.Signal
 	Decision Decision
 	Actions  []ActionRequest
+	Evidence *Evidence
 }
 
 // InputFeatures stores privacy-safe metadata needed to audit missed content.
@@ -238,7 +239,8 @@ func (p *Processor) Process(ctx context.Context, event events.TelegramUpdate) er
 			Profile: profileContext,
 		}))
 	}
-	preliminary := p.decisions.Decide(DecisionInput{Target: actionTarget, Signals: signals})
+	hasMessageContent := strings.TrimSpace(message.Text+message.Caption+message.OCRText) != ""
+	preliminary := p.decisions.Decide(DecisionInput{Target: actionTarget, Signals: signals, HasMessageContent: hasMessageContent})
 	if profileFetchErr != nil && preliminary.RiskScore < 0.90 && isRetryableProfileError(profileFetchErr) {
 		return fmt.Errorf("fetch Telegram profile for moderation: %w", profileFetchErr)
 	}
@@ -246,9 +248,11 @@ func (p *Processor) Process(ctx context.Context, event events.TelegramUpdate) er
 	automaticActionsDisabled := false
 	autobanDisabled := false
 	moderatorChatID := int64(0)
-	if isAutomaticAction(preliminary.AuthorizedAction) {
+	policy := CommunityPolicy{ChatID: target.ChatID, ProtectionLevel: "STRICT", AutomaticActionsEnabled: true, AutobanEnabled: true}
+	if preliminary.AuthorizedAction != ActionAllow {
 		if p.policyStore != nil {
-			policy, err := p.policyStore.GetCommunityPolicy(ctx, event.TenantID, target.ChatID, target.UserID)
+			var err error
+			policy, err = p.policyStore.GetCommunityPolicy(ctx, event.TenantID, target.ChatID, target.UserID)
 			if err != nil {
 				return fmt.Errorf("load community moderation policy: %w", err)
 			}
@@ -257,7 +261,7 @@ func (p *Processor) Process(ctx context.Context, event events.TelegramUpdate) er
 			autobanDisabled = !policy.AutobanEnabled
 			moderatorChatID = policy.ModeratorChatID
 		}
-		if !isProtected && target.UserID > 0 {
+		if isAutomaticAction(preliminary.AuthorizedAction) && !isProtected && target.UserID > 0 {
 			status, err := p.profiles.GetChatMemberStatus(ctx, target.ChatID, target.UserID)
 			if err != nil {
 				return fmt.Errorf("get Telegram member status before automatic action: %w", err)
@@ -267,6 +271,7 @@ func (p *Processor) Process(ctx context.Context, event events.TelegramUpdate) er
 	}
 	decision := p.decisions.Decide(DecisionInput{
 		Target:                   actionTarget,
+		HasMessageContent:        hasMessageContent,
 		Signals:                  signals,
 		IsProtected:              isProtected,
 		AutomaticActionsDisabled: automaticActionsDisabled,
@@ -288,12 +293,18 @@ func (p *Processor) Process(ctx context.Context, event events.TelegramUpdate) er
 		)
 	}
 
+	var evidence *Evidence
+	if decision.AuthorizedAction != ActionAllow {
+		evidence = newEvidence(actionTarget, message, profileContext, signals, decision, policy, isProtected)
+		evidence.AuthorUsername = messageAuthorUsername(event.Payload)
+	}
 	if err := p.store.RecordTerminal(ctx, event, Outcome{
 		State:    state,
 		Input:    inputFeatures(event.Payload, message),
 		Signals:  signals,
 		Decision: decision,
 		Actions:  actions,
+		Evidence: evidence,
 	}); err != nil {
 		return fmt.Errorf("record terminal moderation state: %w", err)
 	}

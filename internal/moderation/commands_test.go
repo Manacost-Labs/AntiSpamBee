@@ -16,6 +16,8 @@ type commandStoreStub struct {
 	moderatorID      int64
 	senderChats      map[int64]bool
 	personalPolicies []CommunityPolicy
+	history          []HistoryEntry
+	historyRead      bool
 }
 
 func (s *commandStoreStub) RecordTerminal(_ context.Context, _ events.TelegramUpdate, outcome Outcome) error {
@@ -54,6 +56,10 @@ func (s *commandStoreStub) GetCommunityPolicy(context.Context, string, int64, in
 }
 func (s *commandStoreStub) ListCommunityPoliciesForModerator(context.Context, string, int64) ([]CommunityPolicy, error) {
 	return s.personalPolicies, nil
+}
+func (s *commandStoreStub) ListModerationHistory(context.Context, string, int64) ([]HistoryEntry, error) {
+	s.historyRead = true
+	return s.history, nil
 }
 
 type commandTelegramStub struct {
@@ -160,7 +166,7 @@ func TestCommandRouterChangesProtectionLevelForAdmin(t *testing.T) {
 }
 
 func TestCommandRouterChangesProtectionLevelForAnonymousAdmin(t *testing.T) {
-	store := &commandStoreStub{senderChats: map[int64]bool{-1001: true}}
+	store := &commandStoreStub{moderatorID: 9, senderChats: map[int64]bool{-1001: true}}
 	telegram := &commandTelegramStub{}
 	router, err := NewCommandRouter(store, telegram, &fallbackStub{}, 0, "AntiSpamBeeBot")
 	if err != nil {
@@ -169,6 +175,7 @@ func TestCommandRouterChangesProtectionLevelForAnonymousAdmin(t *testing.T) {
 	event := telegramEvent(`{
 		"message": {
 			"message_id": 10,
+			"from": {"id":1087968824,"is_bot":true},
 			"sender_chat": {"id": -1001, "type": "supergroup"},
 			"chat": {"id": -1001, "type": "supergroup"},
 			"text": "/protection strict"
@@ -179,6 +186,9 @@ func TestCommandRouterChangesProtectionLevelForAnonymousAdmin(t *testing.T) {
 	}
 	if store.policyLevel != "STRICT" {
 		t.Fatalf("policy level = %q", store.policyLevel)
+	}
+	if store.moderatorID != 9 {
+		t.Fatalf("anonymous Telegram identity replaced moderator: %d", store.moderatorID)
 	}
 	if len(telegram.messages) != 1 || !strings.Contains(telegram.messages[0], "STRICT") {
 		t.Fatalf("messages = %q", telegram.messages)

@@ -25,6 +25,7 @@ type commandStore interface {
 	SetAllowlisted(context.Context, string, int64, int64, int64, bool) error
 	GetCommunityPolicy(context.Context, string, int64, int64) (CommunityPolicy, error)
 	ListCommunityPoliciesForModerator(context.Context, string, int64) ([]CommunityPolicy, error)
+	ListModerationHistory(context.Context, string, int64) ([]HistoryEntry, error)
 }
 
 type commandTelegram interface {
@@ -122,11 +123,13 @@ func (r *CommandRouter) Process(ctx context.Context, event events.TelegramUpdate
 			return err
 		}
 		return r.telegram.SendMessage(ctx, command.ChatID, fmt.Sprintf(
-			"AntiSpamBee: уровень %s, автоматические действия: %t, автобан: %t",
-			policy.ProtectionLevel, policy.AutomaticActionsEnabled, policy.AutobanEnabled,
+			"AntiSpamBee: уровень %s, автоматические действия: %t. Автобан приостановлен до подтверждения нарушений.",
+			policy.ProtectionLevel, policy.AutomaticActionsEnabled,
 		))
 	case "link":
 		return r.handleLink(ctx, event, command)
+	case "history":
+		return r.handleHistory(ctx, event, command)
 	case "protection":
 		return r.handleProtection(ctx, event, command)
 	case "allow", "unallow":
@@ -201,8 +204,8 @@ func (r *CommandRouter) handlePersonalStatus(ctx context.Context, event events.T
 			title = fmt.Sprintf("Группа %d", policy.ChatID)
 		}
 		lines = append(lines, fmt.Sprintf(
-			"%s: уровень %s, автоматические действия: %t, автобан: %t",
-			title, policy.ProtectionLevel, policy.AutomaticActionsEnabled, policy.AutobanEnabled,
+			"%s: уровень %s, автоматические действия: %t. Автобан приостановлен до подтверждения нарушений.\nЖурнал: /history %d",
+			title, policy.ProtectionLevel, policy.AutomaticActionsEnabled, policy.ChatID,
 		))
 	}
 	return r.telegram.SendMessage(ctx, command.ChatID, strings.Join(lines, "\n"))
@@ -334,7 +337,7 @@ func (r *CommandRouter) handleProtection(ctx context.Context, event events.Teleg
 	if err := r.store.SetCommunityProtection(ctx, event.TenantID, command.ChatID, command.Argument); err != nil {
 		return err
 	}
-	if command.SenderID > 0 {
+	if command.SenderID > 0 && command.SenderChatID == 0 {
 		if err := r.store.SetCommunityModerator(ctx, event.TenantID, command.ChatID, command.SenderID); err != nil {
 			return err
 		}
@@ -470,8 +473,22 @@ func (r *CommandRouter) recordCommand(ctx context.Context, event events.Telegram
 			}
 		}
 	}
+	var evidence *Evidence
+	if action != nil {
+		var update struct {
+			Message struct {
+				Reply json.RawMessage `json:"reply_to_message"`
+			} `json:"message"`
+		}
+		_ = json.Unmarshal(event.Payload, &update)
+		reply, _ := json.Marshal(struct {
+			Message json.RawMessage `json:"message"`
+		}{update.Message.Reply})
+		evidence = newEvidence(action.Target, messageContent(reply), detection.Profile{}, []detection.Signal{signal}, decision, CommunityPolicy{}, false)
+		evidence.AuthorUsername = messageAuthorUsername(reply)
+	}
 	return r.store.RecordTerminal(ctx, event, Outcome{
-		State: state, Signals: []detection.Signal{signal}, Decision: decision, Actions: actions,
+		State: state, Signals: []detection.Signal{signal}, Decision: decision, Actions: actions, Evidence: evidence,
 	})
 }
 
@@ -484,11 +501,12 @@ func commandHelp() string {
 
 Для администраторов:
 /status — текущий режим защиты
+/history CHAT_ID — последние решения и сообщения (в ЛС, хранение 30 дней)
 /link — привязать группу к личному кабинету
 /protection observe — только наблюдение
 /protection soft — ручная модерация
 /protection standard — удаление рекламы без автобана
-/protection strict — удаление и автобан при риске 100%
+/protection strict — удаление явной рекламы; автобан пока приостановлен
 /allow и /unallow — добавить или убрать автора из исключений
 /warn — предупредить автора
 /mute — ограничить автора на 1 час

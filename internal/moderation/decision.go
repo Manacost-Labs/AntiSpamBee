@@ -2,6 +2,7 @@ package moderation
 
 import (
 	"fmt"
+	"math"
 	"strings"
 
 	"antispambee/internal/detection"
@@ -38,6 +39,8 @@ const (
 	ReasonAutobanDisabled          = "AUTOBAN_DISABLED"
 	ReasonCertainAdvertising       = "CERTAIN_ADVERTISING"
 	ReasonLikelyAdvertising        = "LIKELY_ADVERTISING"
+	ReasonMessageEvidenceRequired  = "CURRENT_MESSAGE_EVIDENCE_REQUIRED"
+	DecisionPolicyVersion          = "message-evidence-v2"
 )
 
 // ActionTarget contains stable Telegram identifiers needed by an action worker.
@@ -75,6 +78,7 @@ type DeletionNotification struct {
 // DecisionInput is the complete, already-enriched input to the decision engine.
 type DecisionInput struct {
 	Target                   ActionTarget
+	HasMessageContent        bool
 	Signals                  []detection.Signal
 	IsProtected              bool
 	AutomaticActionsDisabled bool
@@ -92,7 +96,8 @@ type Decision struct {
 }
 
 // DecisionEngine applies conservative, deterministic action thresholds.
-// Model detectors stay in shadow until explicitly promoted by a later policy.
+// Automatic enforcement is message-only and delete-only. Manual moderator
+// commands retain their separate authorization path.
 type DecisionEngine struct{}
 
 func NewDecisionEngine() *DecisionEngine { return &DecisionEngine{} }
@@ -103,13 +108,13 @@ func (e *DecisionEngine) Decide(input DecisionInput) Decision {
 		AuthorizedAction:    ActionAllow,
 		AuthorizationReason: ReasonBelowActionThreshold,
 	}
-	highSignalCount := 0
-	hasDeterministicHighSignal := false
-	corroboratedConfidence := 1.0
-	corroboratedCoverage := 1.0
+	hasMessageEvidence := false
 	for _, signal := range input.Signals {
 		if signal.Status != detection.StatusAvailable || signal.Score == nil ||
 			signal.Confidence == nil {
+			continue
+		}
+		if !unitInterval(*signal.Score) || !unitInterval(*signal.Confidence) || !unitInterval(signal.EvidenceCoverage) {
 			continue
 		}
 		isModel := strings.HasPrefix(signal.Detector, "model.")
@@ -122,21 +127,10 @@ func (e *DecisionEngine) Decide(input DecisionInput) Decision {
 			decision.DecisionConfidence = *signal.Confidence
 			decision.EvidenceCoverage = signal.EvidenceCoverage
 		}
-		if *signal.Score >= 0.90 && *signal.Confidence >= 0.90 && signal.EvidenceCoverage >= 0.50 {
-			highSignalCount++
-			hasDeterministicHighSignal = hasDeterministicHighSignal || !isModel
-			if *signal.Confidence < corroboratedConfidence {
-				corroboratedConfidence = *signal.Confidence
-			}
-			if signal.EvidenceCoverage < corroboratedCoverage {
-				corroboratedCoverage = signal.EvidenceCoverage
-			}
+		if (strings.HasPrefix(signal.Detector, "message.") || signal.Detector == "model.jev_advertising") &&
+			*signal.Score >= .90 && *signal.Confidence >= .90 && signal.EvidenceCoverage >= .50 {
+			hasMessageEvidence = true
 		}
-	}
-	if highSignalCount >= 2 && hasDeterministicHighSignal {
-		decision.RiskScore = 1
-		decision.DecisionConfidence = corroboratedConfidence
-		decision.EvidenceCoverage = corroboratedCoverage
 	}
 
 	if decision.RiskScore < 0.90 {
@@ -160,24 +154,15 @@ func (e *DecisionEngine) Decide(input DecisionInput) Decision {
 		decision.AuthorizationReason = ReasonAutomaticActionsDisabled
 		return decision
 	}
-	if input.AutobanDisabled && recommendedAction(decision.RiskScore, input.Target.Kind) == ActionBanUser {
-		decision.RecommendedAction = ActionBanUser
-		if input.Target.Kind == TargetReaction {
-			decision.AuthorizedAction = ActionDeleteReaction
-		} else {
-			decision.AuthorizedAction = ActionDeleteMessage
-		}
-		decision.AuthorizationReason = ReasonAutobanDisabled
+	if input.Target.Kind != TargetMessage || !input.HasMessageContent || !hasMessageEvidence {
+		decision.RecommendedAction = ActionReview
+		decision.AuthorizedAction = ActionReview
+		decision.AuthorizationReason = ReasonMessageEvidenceRequired
 		return decision
 	}
-
 	decision.RecommendedAction = recommendedAction(decision.RiskScore, input.Target.Kind)
 	decision.AuthorizedAction = decision.RecommendedAction
-	if decision.RiskScore >= 1 {
-		decision.AuthorizationReason = ReasonCertainAdvertising
-	} else {
-		decision.AuthorizationReason = ReasonLikelyAdvertising
-	}
+	decision.AuthorizationReason = ReasonLikelyAdvertising
 	if decision.AuthorizedAction == ActionReview {
 		decision.AuthorizationReason = ReasonNoActionableTarget
 	}
@@ -188,9 +173,6 @@ func recommendedAction(score float64, kind TargetKind) ActionType {
 	if kind != TargetMessage && kind != TargetReaction {
 		return ActionReview
 	}
-	if score >= 1 {
-		return ActionBanUser
-	}
 	switch kind {
 	case TargetMessage:
 		return ActionDeleteMessage
@@ -200,6 +182,8 @@ func recommendedAction(score float64, kind TargetKind) ActionType {
 		return ActionReview
 	}
 }
+
+func unitInterval(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) && v >= 0 && v <= 1 }
 
 func actionIdempotencyKey(eventID string, action ActionType, target ActionTarget) string {
 	switch action {

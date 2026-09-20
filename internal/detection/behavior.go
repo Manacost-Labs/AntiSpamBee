@@ -30,7 +30,8 @@ func (d *BehaviorDetector) Analyze(stats BehaviorStats) Signal {
 	reasons := []string{}
 	rules := []string{}
 	if stats.PreviousViolations >= 2 {
-		score = 1
+		// Historical machine decisions are unconfirmed; they cannot escalate to a ban.
+		score = 0.5
 		reasons = append(reasons, ReasonPriorViolation)
 		rules = append(rules, "BEHAVIOR_REPUTATION_01")
 	}

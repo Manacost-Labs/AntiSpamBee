@@ -40,6 +40,8 @@ type Signal struct {
 	ReasonCodes      []string
 	MatchedRules     []string
 	CreatedAt        time.Time
+	ConfiguredModel  string
+	ResolvedModel    string
 }
 
 // Profile contains optional Telegram profile context.

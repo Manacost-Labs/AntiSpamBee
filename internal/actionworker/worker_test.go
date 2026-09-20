@@ -12,24 +12,48 @@ import (
 )
 
 type repositoryStub struct {
-	action       moderation.ClaimedAction
-	found        bool
-	claimErr     error
-	succeeded    bool
-	assumed      bool
-	retryAt      time.Time
-	retryError   string
-	permanentErr string
+	action             moderation.ClaimedAction
+	found              bool
+	claimErr           error
+	succeeded          bool
+	assumed            bool
+	retryAt            time.Time
+	retryError         string
+	permanentErr       string
+	notification       moderation.ClaimedNotification
+	notificationFound  bool
+	notificationStatus string
+	notificationNext   time.Time
+	completionErr      error
 }
 
 func (r *repositoryStub) ClaimAction(context.Context, string, time.Duration) (moderation.ClaimedAction, bool, error) {
 	return r.action, r.found, r.claimErr
 }
 func (r *repositoryStub) MarkActionSucceeded(_ context.Context, _ moderation.ClaimedAction, assumed bool) error {
+	if r.completionErr != nil {
+		return r.completionErr
+	}
 	r.succeeded = true
 	r.assumed = assumed
+	if r.action.Type == moderation.ActionDeleteMessage && r.action.Notification.ChatID > 0 {
+		r.notification = moderation.ClaimedNotification{ActionID: r.action.ActionID, CommunityChatID: r.action.Target.ChatID, Payload: r.action.Notification, Attempts: 1}
+		r.notificationFound = true
+	}
 	return nil
 }
+func (r *repositoryStub) ClaimNotification(context.Context, string, time.Duration) (moderation.ClaimedNotification, bool, error) {
+	return r.notification, r.notificationFound, nil
+}
+func (r *repositoryStub) FinishNotification(_ context.Context, _ moderation.ClaimedNotification, status string, next time.Time, _ string) error {
+	r.notificationStatus = status
+	r.notificationNext = next
+	return nil
+}
+func (r *repositoryStub) NotificationRecipientCurrent(context.Context, moderation.ClaimedNotification) (bool, error) {
+	return true, nil
+}
+func (r *repositoryStub) PurgeExpiredEvidence(context.Context) error { return nil }
 func (r *repositoryStub) MarkActionRetryable(_ context.Context, _ moderation.ClaimedAction, next time.Time, message string) error {
 	r.retryAt = next
 	r.retryError = message
@@ -110,7 +134,7 @@ func TestWorkerNotifiesResponsibleAdminAfterSuccessfulMessageDeletion(t *testing
 		RiskScore:      0.95,
 	}
 	repo := &repositoryStub{found: true, action: action}
-	telegram := &telegramStub{}
+	telegram := &telegramStub{memberStatus: "administrator"}
 	worker := newTestWorker(t, repo, telegram)
 
 	worked, err := worker.RunOnce(context.Background())

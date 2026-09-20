@@ -293,11 +293,11 @@ func TestProcessorChecksProfileOfUserWhoAddsReaction(t *testing.T) {
 	if fetcher.userID != 8373323792 {
 		t.Fatalf("fetched user ID = %d, want 8373323792", fetcher.userID)
 	}
-	if store.outcome.State != DecidedPendingAction {
-		t.Fatalf("terminal state = %q, want %q", store.outcome.State, DecidedPendingAction)
+	if store.outcome.State != ProcessedReview {
+		t.Fatalf("terminal state = %q, want %q", store.outcome.State, ProcessedReview)
 	}
-	if !hasAction(store.outcome, ActionDeleteReaction) {
-		t.Fatalf("actions = %#v, want DELETE_REACTION", store.outcome.Actions)
+	if len(store.outcome.Actions) != 0 {
+		t.Fatalf("actions = %#v, want no action for profile-only evidence", store.outcome.Actions)
 	}
 	profileSignal := signalByDetector(t, store.outcome, "profile.personal_channel")
 	if profileSignal.Score == nil || *profileSignal.Score < 0.9 {

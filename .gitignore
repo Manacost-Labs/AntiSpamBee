@@ -6,3 +6,4 @@
 /gateway
 /coverage.out
 *.test
+/backups/
