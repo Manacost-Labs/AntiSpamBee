@@ -86,6 +86,7 @@ type behaviorStore interface {
 
 type policyStore interface {
 	GetCommunityPolicy(context.Context, string, int64, int64) (CommunityPolicy, error)
+	IsAuthorizedSenderChat(context.Context, string, int64, int64) (bool, error)
 }
 
 // ProcessorOption enables optional detectors without widening the core client contracts.
@@ -138,6 +139,7 @@ type Processor struct {
 	profiles      telegramClient
 	detector      profileDetector
 	messages      *detection.MessageAdDetector
+	channels      *detection.AdvertisingChannelDetector
 	imageText     imageTextExtractor
 	semantic      semanticAdAnalyzer
 	decisions     *DecisionEngine
@@ -146,7 +148,7 @@ type Processor struct {
 	policyStore   policyStore
 }
 
-// NewProcessor constructs the moderation processor with automatic banning.
+// NewProcessor constructs the moderation processor with automatic deletion.
 func NewProcessor(
 	store terminalRecorder,
 	profiles telegramClient,
@@ -167,6 +169,7 @@ func NewProcessor(
 		profiles:  profiles,
 		detector:  detector,
 		messages:  detection.NewMessageAdDetector(),
+		channels:  detection.NewAdvertisingChannelDetector(),
 		decisions: NewDecisionEngine(),
 	}
 	for _, option := range options {
@@ -219,7 +222,7 @@ func (p *Processor) Process(ctx context.Context, event events.TelegramUpdate) er
 			profileSignal = p.detector.Analyze(profile)
 		}
 	}
-	signals := []detection.Signal{messageSignal, profileSignal}
+	signals := []detection.Signal{messageSignal, profileSignal, p.channels.Analyze(profileContext)}
 	if ocrFailureSignal != nil {
 		signals = append(signals, *ocrFailureSignal)
 	}
@@ -244,7 +247,7 @@ func (p *Processor) Process(ctx context.Context, event events.TelegramUpdate) er
 	if profileFetchErr != nil && preliminary.RiskScore < 0.90 && isRetryableProfileError(profileFetchErr) {
 		return fmt.Errorf("fetch Telegram profile for moderation: %w", profileFetchErr)
 	}
-	isProtected := target.isAnonymousAdmin()
+	isProtected := target.isAdminOrigin()
 	automaticActionsDisabled := false
 	autobanDisabled := false
 	moderatorChatID := int64(0)
@@ -257,26 +260,37 @@ func (p *Processor) Process(ctx context.Context, event events.TelegramUpdate) er
 				return fmt.Errorf("load community moderation policy: %w", err)
 			}
 			isProtected = isProtected || policy.IsAllowlisted
+			if !isProtected && target.SenderChatID != 0 {
+				isProtected, err = p.policyStore.IsAuthorizedSenderChat(ctx, event.TenantID, target.ChatID, target.SenderChatID)
+				if err != nil {
+					return fmt.Errorf("check authorized Telegram sender chat: %w", err)
+				}
+			}
 			automaticActionsDisabled = !policy.AutomaticActionsEnabled || policy.ProtectionLevel == "OBSERVE"
 			autobanDisabled = !policy.AutobanEnabled
 			moderatorChatID = policy.ModeratorChatID
 		}
-		if isAutomaticAction(preliminary.AuthorizedAction) && !isProtected && target.UserID > 0 {
-			status, err := p.profiles.GetChatMemberStatus(ctx, target.ChatID, target.UserID)
-			if err != nil {
-				return fmt.Errorf("get Telegram member status before automatic action: %w", err)
-			}
-			isProtected = status == "creator" || status == "administrator"
-		}
 	}
-	decision := p.decisions.Decide(DecisionInput{
-		Target:                   actionTarget,
-		HasMessageContent:        hasMessageContent,
-		Signals:                  signals,
-		IsProtected:              isProtected,
-		AutomaticActionsDisabled: automaticActionsDisabled,
-		AutobanDisabled:          autobanDisabled,
-	})
+	decisionInput := DecisionInput{
+		Target:                          actionTarget,
+		HasMessageContent:               hasMessageContent,
+		Signals:                         signals,
+		IsProtected:                     isProtected,
+		UnverifiedSender:                target.UserID <= 0 && !isProtected,
+		AutomaticActionsDisabled:        automaticActionsDisabled,
+		AutobanDisabled:                 autobanDisabled,
+		AllowAdvertisingChannelDeletion: policy.ProtectionLevel == "STRICT",
+	}
+	candidate := p.decisions.Decide(decisionInput)
+	if isAutomaticAction(candidate.AuthorizedAction) && !isProtected && target.UserID > 0 {
+		status, err := p.profiles.GetChatMemberStatus(ctx, target.ChatID, target.UserID)
+		if err != nil {
+			return fmt.Errorf("get Telegram member status before automatic action: %w", err)
+		}
+		decisionInput.IsProtected = status == "creator" || status == "administrator"
+	}
+	decision := p.decisions.Decide(decisionInput)
+	isProtected = decisionInput.IsProtected
 	if ocrFailureSignal != nil && decision.RiskScore < 0.90 {
 		decision.RecommendedAction = ActionReview
 		decision.AuthorizedAction = ActionReview
@@ -680,16 +694,17 @@ func appendUniqueURL(values []string, value string) []string {
 }
 
 type moderationTarget struct {
-	ChatID       int64
-	UserID       int64
-	MessageID    int64
-	ChatType     string
-	SenderChatID int64
-	Kind         TargetKind
+	ChatID             int64
+	UserID             int64
+	MessageID          int64
+	ChatType           string
+	SenderChatID       int64
+	IsAutomaticForward bool
+	Kind               TargetKind
 }
 
-func (t moderationTarget) isAnonymousAdmin() bool {
-	return t.SenderChatID != 0 && t.SenderChatID == t.ChatID
+func (t moderationTarget) isAdminOrigin() bool {
+	return t.SenderChatID != 0 && (t.SenderChatID == t.ChatID || t.IsAutomaticForward)
 }
 
 func (t moderationTarget) actionTarget() ActionTarget {
@@ -714,10 +729,11 @@ func moderationTargetFrom(payload json.RawMessage) moderationTarget {
 		Type string `json:"type"`
 	}
 	type message struct {
-		MessageID  int64   `json:"message_id"`
-		From       *sender `json:"from"`
-		Chat       *chat   `json:"chat"`
-		SenderChat *chat   `json:"sender_chat"`
+		MessageID          int64   `json:"message_id"`
+		From               *sender `json:"from"`
+		Chat               *chat   `json:"chat"`
+		SenderChat         *chat   `json:"sender_chat"`
+		IsAutomaticForward bool    `json:"is_automatic_forward"`
 	}
 	var update struct {
 		Message               *message `json:"message"`
@@ -751,6 +767,10 @@ func moderationTargetFrom(payload json.RawMessage) moderationTarget {
 		}
 		if senderChat != nil {
 			target.SenderChatID = senderChat.ID
+			if senderChat.ID != 0 {
+				// Telegram's from field is a compatibility placeholder for chat senders.
+				target.UserID = 0
+			}
 		}
 		return target
 	}
@@ -763,7 +783,9 @@ func moderationTargetFrom(payload json.RawMessage) moderationTarget {
 		update.EditedChannelPost,
 	} {
 		if candidate != nil {
-			return targetFrom(candidate.Chat, candidate.From, candidate.SenderChat, candidate.MessageID, TargetMessage)
+			target := targetFrom(candidate.Chat, candidate.From, candidate.SenderChat, candidate.MessageID, TargetMessage)
+			target.IsAutomaticForward = candidate.IsAutomaticForward
+			return target
 		}
 	}
 	if update.CallbackQuery != nil && update.CallbackQuery.From != nil && update.CallbackQuery.From.ID > 0 {

@@ -47,6 +47,64 @@ func TestDecisionEngineReviewsReactionWithSuspiciousProfile(t *testing.T) {
 	}
 }
 
+func TestDecisionEngineReviewsStrongPersonalChannelAdWithoutMessageEvidence(t *testing.T) {
+	engine := NewDecisionEngine()
+	input := DecisionInput{
+		Target:                          ActionTarget{Kind: TargetMessage, ChatID: -1001, UserID: 42, MessageID: 7},
+		Signals:                         []detection.Signal{availableSignal("profile.personal_channel", 1, .95, 1)},
+		AllowAdvertisingChannelDeletion: true,
+	}
+	decision := engine.Decide(input)
+	if decision.AuthorizedAction != ActionReview || decision.AuthorizationReason != ReasonMessageEvidenceRequired {
+		t.Fatalf("decision = %+v, want profile-only REVIEW", decision)
+	}
+
+	input.IsProtected = true
+	if decision := engine.Decide(input); decision.AuthorizedAction != ActionReview {
+		t.Fatalf("protected decision = %+v, want REVIEW", decision)
+	}
+
+	input.IsProtected = false
+	input.Target.Kind = TargetReaction
+	if decision := engine.Decide(input); decision.AuthorizedAction != ActionReview {
+		t.Fatalf("reaction decision = %+v, want REVIEW", decision)
+	}
+}
+
+func TestDecisionEngineDeletesOnlyConfirmedAdvertisingChannelsWhenEnabled(t *testing.T) {
+	for _, tc := range []struct {
+		name                                  string
+		enabled, protected, unknown, disabled bool
+		kind                                  TargetKind
+		excerpt                               string
+		want                                  ActionType
+	}{
+		{"confirmed channel", true, false, false, false, TargetMessage, "complete promotional offer", ActionDeleteMessage},
+		{"policy disabled", false, false, false, false, TargetMessage, "complete promotional offer", ActionReview},
+		{"administrator", true, true, false, false, TargetMessage, "complete promotional offer", ActionReview},
+		{"unknown author", true, false, true, false, TargetMessage, "complete promotional offer", ActionReview},
+		{"automatic actions disabled", true, false, false, true, TargetMessage, "complete promotional offer", ActionReview},
+		{"missing post evidence", true, false, false, false, TargetMessage, "", ActionReview},
+		{"reaction", true, false, false, false, TargetReaction, "complete promotional offer", ActionReview},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			signal := availableSignal(detection.AdvertisingChannelDetectorName, .95, .95, 1)
+			signal.EvidenceExcerpt = tc.excerpt
+			decision := NewDecisionEngine().Decide(DecisionInput{
+				Target:  ActionTarget{Kind: tc.kind, ChatID: -1001, UserID: 42, MessageID: 7},
+				Signals: []detection.Signal{signal}, AllowAdvertisingChannelDeletion: tc.enabled,
+				IsProtected: tc.protected, UnverifiedSender: tc.unknown, AutomaticActionsDisabled: tc.disabled,
+			})
+			if decision.AuthorizedAction != tc.want {
+				t.Fatalf("decision = %+v, want %s", decision, tc.want)
+			}
+			if tc.want == ActionDeleteMessage && decision.AuthorizationReason != ReasonConfirmedAdvertisingChannel {
+				t.Fatalf("authorization reason = %s", decision.AuthorizationReason)
+			}
+		})
+	}
+}
+
 func TestDecisionEngineUsesHighConfidenceModelForDeleteOnly(t *testing.T) {
 	engine := NewDecisionEngine()
 

@@ -124,13 +124,16 @@ func (c *Client) FetchProfile(ctx context.Context, userID int64) (detection.Prof
 
 	posts := make([]string, 0, len(messages))
 	for _, message := range messages {
+		if message.ChannelChatCreated {
+			continue
+		}
 		text := message.Text
 		if text == "" {
 			text = message.Caption
 		}
-		if text != "" {
-			posts = append(posts, text)
-		}
+		// Keep media-only posts: omitting them could make a personal music/photo
+		// channel with one sponsored post look like an advertising-only channel.
+		posts = append(posts, text)
 	}
 	profile.PersonalChannel = &detection.PersonalChannel{
 		Title:       firstNonEmpty(channel.Title, userChat.PersonalChat.Title),
@@ -576,9 +579,10 @@ type chatFullInfo struct {
 }
 
 type message struct {
-	MessageID int64  `json:"message_id"`
-	Text      string `json:"text"`
-	Caption   string `json:"caption"`
+	MessageID          int64  `json:"message_id"`
+	Text               string `json:"text"`
+	Caption            string `json:"caption"`
+	ChannelChatCreated bool   `json:"channel_chat_created"`
 }
 
 func firstNonEmpty(values ...string) string {

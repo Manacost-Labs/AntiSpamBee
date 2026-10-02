@@ -31,16 +31,19 @@ const (
 )
 
 const (
-	ReasonBelowActionThreshold     = "BELOW_ACTION_THRESHOLD"
-	ReasonInsufficientEvidence     = "INSUFFICIENT_CONFIDENCE_OR_COVERAGE"
-	ReasonNoActionableTarget       = "NO_ACTIONABLE_TARGET"
-	ReasonProtectedMember          = "PROTECTED_MEMBER"
-	ReasonAutomaticActionsDisabled = "AUTOMATIC_ACTIONS_DISABLED"
-	ReasonAutobanDisabled          = "AUTOBAN_DISABLED"
-	ReasonCertainAdvertising       = "CERTAIN_ADVERTISING"
-	ReasonLikelyAdvertising        = "LIKELY_ADVERTISING"
-	ReasonMessageEvidenceRequired  = "CURRENT_MESSAGE_EVIDENCE_REQUIRED"
-	DecisionPolicyVersion          = "message-evidence-v3"
+	ReasonBelowActionThreshold        = "BELOW_ACTION_THRESHOLD"
+	ReasonInsufficientEvidence        = "INSUFFICIENT_CONFIDENCE_OR_COVERAGE"
+	ReasonNoActionableTarget          = "NO_ACTIONABLE_TARGET"
+	ReasonProtectedMember             = "PROTECTED_MEMBER"
+	ReasonUnverifiedSender            = "SENDER_IDENTITY_UNVERIFIED"
+	ReasonAutomaticActionsDisabled    = "AUTOMATIC_ACTIONS_DISABLED"
+	ReasonAutobanDisabled             = "AUTOBAN_DISABLED"
+	ReasonCertainAdvertising          = "CERTAIN_ADVERTISING"
+	ReasonLikelyAdvertising           = "LIKELY_ADVERTISING"
+	ReasonMessageEvidenceRequired     = "CURRENT_MESSAGE_EVIDENCE_REQUIRED"
+	ReasonProfileChannelAdvertising   = "PROFILE_CHANNEL_ADVERTISING"
+	ReasonConfirmedAdvertisingChannel = detection.ReasonConfirmedAdvertisingChannel
+	DecisionPolicyVersion             = "message-evidence-v6"
 )
 
 // ActionTarget contains stable Telegram identifiers needed by an action worker.
@@ -53,15 +56,16 @@ type ActionTarget struct {
 
 // ClaimedAction is a leased database action ready for one execution attempt.
 type ClaimedAction struct {
-	ActionID     string
-	EventID      string
-	TenantID     string
-	LeaseOwner   string
-	Type         ActionType
-	Target       ActionTarget
-	AttemptCount int
-	UntilDate    int64
-	Notification DeletionNotification
+	ActionID            string
+	EventID             string
+	TenantID            string
+	LeaseOwner          string
+	Type                ActionType
+	Target              ActionTarget
+	AttemptCount        int
+	UntilDate           int64
+	Notification        DeletionNotification
+	AuthorizationReason string
 }
 
 // DeletionNotification is the short-lived context sent to the community
@@ -77,12 +81,14 @@ type DeletionNotification struct {
 
 // DecisionInput is the complete, already-enriched input to the decision engine.
 type DecisionInput struct {
-	Target                   ActionTarget
-	HasMessageContent        bool
-	Signals                  []detection.Signal
-	IsProtected              bool
-	AutomaticActionsDisabled bool
-	AutobanDisabled          bool
+	Target                          ActionTarget
+	HasMessageContent               bool
+	Signals                         []detection.Signal
+	IsProtected                     bool
+	UnverifiedSender                bool
+	AutomaticActionsDisabled        bool
+	AutobanDisabled                 bool
+	AllowAdvertisingChannelDeletion bool
 }
 
 // Decision separates detector recommendation from policy authorization.
@@ -109,6 +115,7 @@ func (e *DecisionEngine) Decide(input DecisionInput) Decision {
 		AuthorizationReason: ReasonBelowActionThreshold,
 	}
 	hasMessageEvidence := false
+	hasAdvertisingChannelEvidence := false
 	for _, signal := range input.Signals {
 		if signal.Status != detection.StatusAvailable || signal.Score == nil ||
 			signal.Confidence == nil {
@@ -131,6 +138,11 @@ func (e *DecisionEngine) Decide(input DecisionInput) Decision {
 			*signal.Score >= .90 && *signal.Confidence >= .90 && signal.EvidenceCoverage >= .50 {
 			hasMessageEvidence = true
 		}
+		if signal.Detector == detection.AdvertisingChannelDetectorName &&
+			*signal.Score >= .90 && *signal.Confidence >= .90 && signal.EvidenceCoverage >= .50 &&
+			strings.TrimSpace(signal.EvidenceExcerpt) != "" {
+			hasAdvertisingChannelEvidence = true
+		}
 	}
 
 	if decision.RiskScore < 0.90 {
@@ -152,6 +164,19 @@ func (e *DecisionEngine) Decide(input DecisionInput) Decision {
 		decision.RecommendedAction = recommendedAction(decision.RiskScore, input.Target.Kind)
 		decision.AuthorizedAction = ActionReview
 		decision.AuthorizationReason = ReasonAutomaticActionsDisabled
+		return decision
+	}
+	if input.UnverifiedSender {
+		decision.RecommendedAction = ActionReview
+		decision.AuthorizedAction = ActionReview
+		decision.AuthorizationReason = ReasonUnverifiedSender
+		return decision
+	}
+	if input.Target.Kind == TargetMessage && input.AllowAdvertisingChannelDeletion &&
+		hasAdvertisingChannelEvidence && (!input.HasMessageContent || !hasMessageEvidence) {
+		decision.RecommendedAction = ActionDeleteMessage
+		decision.AuthorizedAction = ActionDeleteMessage
+		decision.AuthorizationReason = ReasonConfirmedAdvertisingChannel
 		return decision
 	}
 	if input.Target.Kind != TargetMessage || !input.HasMessageContent || !hasMessageEvidence {

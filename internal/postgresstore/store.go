@@ -70,7 +70,8 @@ func (s *Store) ClaimAction(
 			action.notification_author_user_id,
 			action.notification_message,
 			action.notification_reasons,
-			action.notification_risk_score
+			action.notification_risk_score,
+			(SELECT authorization_reason FROM moderation_decisions WHERE decision_id = action.decision_id)
 	`, owner, lease.Milliseconds()).Scan(
 		&action.ActionID,
 		&action.EventID,
@@ -88,6 +89,7 @@ func (s *Store) ClaimAction(
 		&action.Notification.Message,
 		&action.Notification.Reasons,
 		&action.Notification.RiskScore,
+		&action.AuthorizationReason,
 	)
 	if errorsIsNoRows(err) {
 		return moderation.ClaimedAction{}, false, nil
@@ -155,6 +157,11 @@ func (s *Store) MarkActionPermanentFailure(
 	message string,
 ) error {
 	return s.finishAction(ctx, action, "PERMANENT_FAILED", moderation.TerminalState("DEAD_LETTER"), "ACTION_FAILED", message)
+}
+
+// MarkActionCancelled records a policy veto without reporting a Telegram failure.
+func (s *Store) MarkActionCancelled(ctx context.Context, action moderation.ClaimedAction, message string) error {
+	return s.finishAction(ctx, action, "CANCELLED", moderation.ProcessedReview, "ACTION_CANCELLED", message)
 }
 
 func (s *Store) finishAction(

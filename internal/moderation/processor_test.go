@@ -3,6 +3,7 @@ package moderation
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 
 	"antispambee/internal/detection"
@@ -17,8 +18,13 @@ type recordingStore struct {
 }
 
 type communityPolicyStub struct {
-	policy CommunityPolicy
-	err    error
+	policy               CommunityPolicy
+	err                  error
+	authorizedSenderChat bool
+}
+
+func (s *communityPolicyStub) IsAuthorizedSenderChat(context.Context, string, int64, int64) (bool, error) {
+	return s.authorizedSenderChat, s.err
 }
 
 func (s *communityPolicyStub) GetCommunityPolicy(context.Context, string, int64, int64) (CommunityPolicy, error) {
@@ -61,6 +67,7 @@ type profileFetcherStub struct {
 	err          error
 	userID       int64
 	calls        int
+	memberCalls  int
 	memberStatus string
 	memberErr    error
 }
@@ -95,10 +102,149 @@ func (f *profileFetcherStub) FetchProfile(_ context.Context, userID int64) (dete
 }
 
 func (f *profileFetcherStub) GetChatMemberStatus(_ context.Context, _, _ int64) (string, error) {
+	f.memberCalls++
 	if f.memberStatus == "" {
 		return "member", f.memberErr
 	}
 	return f.memberStatus, f.memberErr
+}
+
+func TestProcessorNeverDeletesForUnconfirmedPersonalChannel(t *testing.T) {
+	adChannel := &detection.PersonalChannel{
+		Title:       "Работа",
+		RecentPosts: []string{"Нужны сотрудники на частичную занятость, заработок без вложений. Пишите в личку."},
+	}
+	event := telegramEvent(`{"message":{"message_id":53384,"from":{"id":42},"chat":{"id":-100777,"type":"supergroup"},"text":"Вот это жесть, ждем новых тактик"}}`)
+	for _, tc := range []struct {
+		name            string
+		profile         detection.Profile
+		policy          CommunityPolicy
+		payload         string
+		wantAction      bool
+		wantMemberCheck bool
+	}{
+		{"strict", detection.Profile{PersonalChannel: adChannel}, CommunityPolicy{ProtectionLevel: "STRICT", AutomaticActionsEnabled: true}, "", false, false},
+		{"strict media", detection.Profile{PersonalChannel: adChannel}, CommunityPolicy{ProtectionLevel: "STRICT", AutomaticActionsEnabled: true}, `{"message":{"message_id":53384,"from":{"id":42},"chat":{"id":-100777,"type":"supergroup"},"photo":[{"file_id":"photo-id"}]}}`, false, false},
+		{"music channel", detection.Profile{Bio: "Мой канал t.me/music_example", PersonalChannel: &detection.PersonalChannel{Title: "Музыка", RecentPosts: []string{"Обсуждаем музыку и новые альбомы"}}}, CommunityPolicy{ProtectionLevel: "STRICT", AutomaticActionsEnabled: true}, "", false, false},
+		{"standard", detection.Profile{PersonalChannel: adChannel}, CommunityPolicy{ProtectionLevel: "STANDARD", AutomaticActionsEnabled: true}, "", false, false},
+		{"disabled", detection.Profile{PersonalChannel: adChannel}, CommunityPolicy{ProtectionLevel: "STRICT", AutomaticActionsEnabled: false}, "", false, false},
+		{"allowlisted", detection.Profile{PersonalChannel: adChannel}, CommunityPolicy{ProtectionLevel: "STRICT", AutomaticActionsEnabled: true, IsAllowlisted: true}, "", false, false},
+		{"bio only", detection.Profile{Bio: "Нужны сотрудники на частичную занятость, заработок без вложений", PersonalChannel: &detection.PersonalChannel{Title: "Игры"}}, CommunityPolicy{ProtectionLevel: "STRICT", AutomaticActionsEnabled: true}, "", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &recordingStore{}
+			fetcher := &profileFetcherStub{profile: tc.profile}
+			processor, err := NewProcessor(store, fetcher, detection.NewProfileDetector(), WithPolicyStore(&communityPolicyStub{policy: tc.policy}))
+			if err != nil {
+				t.Fatalf("NewProcessor() error = %v", err)
+			}
+			selectedEvent := event
+			if tc.payload != "" {
+				selectedEvent = telegramEvent(tc.payload)
+			}
+			if err := processor.Process(context.Background(), selectedEvent); err != nil {
+				t.Fatalf("Process() error = %v", err)
+			}
+			if got := hasAction(store.outcome, ActionDeleteMessage); got != tc.wantAction {
+				t.Fatalf("delete action = %v, want %v; decision = %+v", got, tc.wantAction, store.outcome.Decision)
+			}
+			if got := fetcher.memberCalls > 0; got != tc.wantMemberCheck {
+				t.Fatalf("member check = %v, want %v", got, tc.wantMemberCheck)
+			}
+		})
+	}
+}
+
+func TestProcessorEnforcesConfirmedAdvertisingChannelWithAdminProtection(t *testing.T) {
+	post := "Нужны сотрудники на частичную занятость (час/два в день). Вакансия: Хеш-фаундер (без вложений). Оплата: 8 000 рублей за объем работы. Время выполнения: 4–6 часов. За подробностями, пишите Евгению. Пост размещен на правах рекламы."
+	for _, tc := range []struct {
+		name, level, status         string
+		enabled, allowlisted, media bool
+		memberErr                   error
+		wantDelete                  bool
+	}{
+		{"ordinary member", "STRICT", "member", true, false, false, nil, true},
+		{"media message", "STRICT", "member", true, false, true, nil, true},
+		{"administrator", "STRICT", "administrator", true, false, false, nil, false},
+		{"owner", "STRICT", "creator", true, false, false, nil, false},
+		{"standard", "STANDARD", "member", true, false, false, nil, false},
+		{"disabled", "STRICT", "member", false, false, false, nil, false},
+		{"allowlisted", "STRICT", "member", true, true, false, nil, false},
+		{"status error", "STRICT", "", true, false, false, errors.New("Telegram unavailable"), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &recordingStore{}
+			fetcher := &profileFetcherStub{profile: detection.Profile{PersonalChannel: &detection.PersonalChannel{Title: "What??", RecentPosts: []string{post}}}, memberStatus: tc.status, memberErr: tc.memberErr}
+			processor, err := NewProcessor(store, fetcher, detection.NewProfileDetector(), WithPolicyStore(&communityPolicyStub{policy: CommunityPolicy{ProtectionLevel: tc.level, AutomaticActionsEnabled: tc.enabled, IsAllowlisted: tc.allowlisted}}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			payload := `{"message":{"message_id":53384,"from":{"id":42},"chat":{"id":-100777,"type":"supergroup"},"text":"О, круто, ждем обнову!"}}`
+			if tc.media {
+				payload = `{"message":{"message_id":53384,"from":{"id":42},"chat":{"id":-100777,"type":"supergroup"},"photo":[{"file_id":"photo-id"}]}}`
+			}
+			err = processor.Process(context.Background(), telegramEvent(payload))
+			if tc.memberErr != nil {
+				if err == nil || store.event.EventID != "" {
+					t.Fatalf("status error must retry without recording actions: %v, %+v", err, store.outcome)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if hasAction(store.outcome, ActionDeleteMessage) != tc.wantDelete || hasAction(store.outcome, ActionBanUser) {
+				t.Fatalf("unexpected actions: %+v", store.outcome)
+			}
+			if tc.wantDelete && store.outcome.Decision.AuthorizationReason != ReasonConfirmedAdvertisingChannel {
+				t.Fatalf("decision = %+v", store.outcome.Decision)
+			}
+		})
+	}
+}
+
+func TestProcessorProtectsAdministratorMessageOrigins(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		status          string
+		extra           string
+		authorizedChat  bool
+		wantDelete      bool
+		wantMemberCalls int
+	}{
+		{"administrator", "administrator", "", false, false, 1},
+		{"owner", "creator", "", false, false, 1},
+		{"anonymous administrator", "member", `,"sender_chat":{"id":-100777,"type":"supergroup"}`, false, false, 0},
+		{"linked channel forward", "member", `,"sender_chat":{"id":-100888,"type":"channel"},"is_automatic_forward":true`, false, false, 0},
+		{"authorized channel", "member", `,"sender_chat":{"id":-100888,"type":"channel"}`, true, false, 0},
+		{"ordinary member advertising", "member", "", false, true, 1},
+		{"unrelated channel advertising", "member", `,"sender_chat":{"id":-100888,"type":"channel"}`, false, false, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &recordingStore{}
+			fetcher := &profileFetcherStub{memberStatus: tc.status}
+			processor, err := NewProcessor(store, fetcher, detection.NewProfileDetector(), WithPolicyStore(&communityPolicyStub{
+				policy:               CommunityPolicy{ProtectionLevel: "STRICT", AutomaticActionsEnabled: true},
+				authorizedSenderChat: tc.authorizedChat,
+			}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			payload := fmt.Sprintf(`{"message":{"message_id":5,"from":{"id":42},"chat":{"id":-100777,"type":"supergroup"},"text":"Казино: бонус 500%% за депозит. Забрать по ссылке https://example.test"%s}}`, tc.extra)
+			if err := processor.Process(context.Background(), telegramEvent(payload)); err != nil {
+				t.Fatal(err)
+			}
+			if got := hasAction(store.outcome, ActionDeleteMessage); got != tc.wantDelete {
+				t.Fatalf("delete = %v, want %v; decision = %+v", got, tc.wantDelete, store.outcome.Decision)
+			}
+			if fetcher.memberCalls != tc.wantMemberCalls {
+				t.Fatalf("member checks = %d, want %d", fetcher.memberCalls, tc.wantMemberCalls)
+			}
+			if tc.extra != "" && fetcher.calls != 0 {
+				t.Fatal("fake sender must not be fetched as a user profile")
+			}
+		})
+	}
 }
 
 func TestProcessorRecordsReviewForProfileJobSpam(t *testing.T) {
@@ -436,7 +582,7 @@ func TestProcessorQueuesExclusiveVPNPromotionDeletionWithBareDomain(t *testing.T
 	}
 }
 
-func TestProcessorDeletesAdvertisingMessageSentAsChannel(t *testing.T) {
+func TestProcessorReviewsAdvertisingFromUnverifiedChannelSender(t *testing.T) {
 	store := &recordingStore{}
 	fetcher := &profileFetcherStub{}
 	processor, err := NewProcessor(store, fetcher, detection.NewProfileDetector())
@@ -456,8 +602,8 @@ func TestProcessorDeletesAdvertisingMessageSentAsChannel(t *testing.T) {
 		t.Fatalf("Process() error = %v", err)
 	}
 
-	if !hasAction(store.outcome, ActionDeleteMessage) {
-		t.Fatalf("actions = %#v, want DELETE_MESSAGE", store.outcome.Actions)
+	if len(store.outcome.Actions) != 0 || store.outcome.Decision.AuthorizationReason != ReasonUnverifiedSender {
+		t.Fatalf("outcome = %#v, want unverified-sender REVIEW", store.outcome)
 	}
 	if fetcher.calls != 0 {
 		t.Fatalf("profile fetch calls = %d, want 0 for sender_chat", fetcher.calls)
@@ -491,7 +637,7 @@ func TestProcessorKeepsAnonymousAdminMessageForReview(t *testing.T) {
 	}
 }
 
-func TestProcessorDeletesAdvertisingChannelPost(t *testing.T) {
+func TestProcessorReviewsChannelPostWithoutVerifiableAuthor(t *testing.T) {
 	store := &recordingStore{}
 	fetcher := &profileFetcherStub{}
 	processor, err := NewProcessor(store, fetcher, detection.NewProfileDetector())
@@ -511,11 +657,11 @@ func TestProcessorDeletesAdvertisingChannelPost(t *testing.T) {
 		t.Fatalf("Process() error = %v", err)
 	}
 
-	if store.outcome.State != DecidedPendingAction {
-		t.Fatalf("terminal state = %q, want %q", store.outcome.State, DecidedPendingAction)
+	if store.outcome.State != ProcessedReview {
+		t.Fatalf("terminal state = %q, want %q", store.outcome.State, ProcessedReview)
 	}
-	if !hasAction(store.outcome, ActionDeleteMessage) {
-		t.Fatalf("actions = %#v, want DELETE_MESSAGE", store.outcome.Actions)
+	if len(store.outcome.Actions) != 0 || store.outcome.Decision.AuthorizationReason != ReasonUnverifiedSender {
+		t.Fatalf("outcome = %#v, want unverified-sender REVIEW", store.outcome)
 	}
 	if fetcher.calls != 0 {
 		t.Fatalf("profile fetch calls = %d, want 0 for channel_post", fetcher.calls)
@@ -723,7 +869,7 @@ func TestProcessorKeepsProtectedMemberForReview(t *testing.T) {
 			"message_id": 92,
 			"from": {"id": 42},
 			"chat": {"id": -100777, "type": "supergroup"},
-			"text": "Привет"
+			"text": "Казино: бонус 500% за депозит. Забрать по ссылке https://example.test"
 		}
 	}`)
 
@@ -732,6 +878,9 @@ func TestProcessorKeepsProtectedMemberForReview(t *testing.T) {
 	}
 	if store.outcome.State != ProcessedReview || len(store.outcome.Actions) != 0 {
 		t.Fatalf("outcome = %#v, want protected REVIEW", store.outcome)
+	}
+	if fetcher.memberCalls != 1 {
+		t.Fatalf("member status checks = %d, want 1", fetcher.memberCalls)
 	}
 }
 

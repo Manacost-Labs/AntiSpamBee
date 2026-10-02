@@ -20,6 +20,7 @@ type repositoryStub struct {
 	retryAt            time.Time
 	retryError         string
 	permanentErr       string
+	cancelledErr       string
 	notification       moderation.ClaimedNotification
 	notificationFound  bool
 	notificationStatus string
@@ -64,11 +65,17 @@ func (r *repositoryStub) MarkActionPermanentFailure(_ context.Context, _ moderat
 	return nil
 }
 
+func (r *repositoryStub) MarkActionCancelled(_ context.Context, _ moderation.ClaimedAction, message string) error {
+	r.cancelledErr = message
+	return nil
+}
+
 type telegramStub struct {
 	banErr            error
 	deleteMessageErr  error
 	deleteReactionErr error
 	memberStatus      string
+	memberStatuses    map[int64]string
 	memberStatusErr   error
 	bans              int
 	messageDeletes    int
@@ -92,7 +99,13 @@ func (t *telegramStub) DeleteMessageReaction(context.Context, int64, int64, int6
 	t.reactionDeletes++
 	return t.deleteReactionErr
 }
-func (t *telegramStub) GetChatMemberStatus(context.Context, int64, int64) (string, error) {
+func (t *telegramStub) GetChatMemberStatus(_ context.Context, _ int64, userID int64) (string, error) {
+	if status, ok := t.memberStatuses[userID]; ok {
+		return status, t.memberStatusErr
+	}
+	if t.memberStatus == "" {
+		return "member", t.memberStatusErr
+	}
 	return t.memberStatus, t.memberStatusErr
 }
 func (t *telegramStub) RestrictChatMember(context.Context, int64, int64, int64) error {
@@ -134,7 +147,7 @@ func TestWorkerNotifiesResponsibleAdminAfterSuccessfulMessageDeletion(t *testing
 		RiskScore:      0.95,
 	}
 	repo := &repositoryStub{found: true, action: action}
-	telegram := &telegramStub{memberStatus: "administrator"}
+	telegram := &telegramStub{memberStatuses: map[int64]string{9001: "administrator"}}
 	worker := newTestWorker(t, repo, telegram)
 
 	worked, err := worker.RunOnce(context.Background())
@@ -147,6 +160,65 @@ func TestWorkerNotifiesResponsibleAdminAfterSuccessfulMessageDeletion(t *testing
 	for _, wanted := range []string{"@spam_account", "Подключай VPN со скидкой", "коммерческая реклама", "реклама VPN"} {
 		if !strings.Contains(telegram.messages[0], wanted) {
 			t.Fatalf("notification %q does not contain %q", telegram.messages[0], wanted)
+		}
+	}
+}
+
+func TestWorkerRechecksAdministratorBeforeDeletingMessage(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		status     string
+		statusErr  error
+		reason     string
+		wantDelete bool
+		wantCancel bool
+		wantRetry  bool
+	}{
+		{"administrator", "administrator", nil, "", false, true, false},
+		{"owner", "creator", nil, "", false, true, false},
+		{"ordinary member", "member", nil, "", true, false, false},
+		{"unavailable member status", "", errors.New("Telegram unavailable"), "", false, false, true},
+		{"legacy profile-only action", "member", nil, moderation.ReasonProfileChannelAdvertising, false, true, false},
+		{"confirmed channel member", "member", nil, moderation.ReasonConfirmedAdvertisingChannel, true, false, false},
+		{"confirmed channel administrator", "administrator", nil, moderation.ReasonConfirmedAdvertisingChannel, false, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			action := claimedAction(moderation.ActionDeleteMessage, 1)
+			action.AuthorizationReason = tc.reason
+			repo := &repositoryStub{found: true, action: action}
+			tg := &telegramStub{memberStatus: tc.status, memberStatusErr: tc.statusErr}
+			worker := newTestWorker(t, repo, tg)
+			if worked, err := worker.RunOnce(context.Background()); !worked || err != nil {
+				t.Fatalf("RunOnce() = %v, %v", worked, err)
+			}
+			if got := tg.messageDeletes > 0; got != tc.wantDelete {
+				t.Fatalf("delete = %v, want %v", got, tc.wantDelete)
+			}
+			if got := repo.cancelledErr != ""; got != tc.wantCancel {
+				t.Fatalf("cancel = %v, want %v", got, tc.wantCancel)
+			}
+			if got := repo.retryError != ""; got != tc.wantRetry {
+				t.Fatalf("retry = %v, want %v", got, tc.wantRetry)
+			}
+			if tc.wantCancel && repo.succeeded {
+				t.Fatal("cancelled action cannot be marked succeeded")
+			}
+		})
+	}
+}
+
+func TestWorkerCancelsDeletionWithoutRealAuthor(t *testing.T) {
+	for _, userID := range []int64{0, 777000, 1087968824} {
+		action := claimedAction(moderation.ActionDeleteMessage, 1)
+		action.Target.UserID = userID
+		repo := &repositoryStub{found: true, action: action}
+		tg := &telegramStub{}
+		worker := newTestWorker(t, repo, tg)
+		if worked, err := worker.RunOnce(context.Background()); !worked || err != nil {
+			t.Fatalf("RunOnce() = %v, %v", worked, err)
+		}
+		if tg.messageDeletes != 0 || repo.cancelledErr == "" {
+			t.Fatalf("author %d: deletes=%d cancelled=%q", userID, tg.messageDeletes, repo.cancelledErr)
 		}
 	}
 }

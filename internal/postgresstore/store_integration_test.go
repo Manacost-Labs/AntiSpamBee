@@ -290,6 +290,41 @@ func TestStoreRecordTerminalIsIdempotent(t *testing.T) {
 	if actionCount != 1 || storedActionType != string(moderation.ActionDeleteMessage) {
 		t.Fatalf("changed replay created action: count/type = %d/%q", actionCount, storedActionType)
 	}
+
+	cancelledEvent := event
+	cancelledEvent.EventID = "82373d0f-5740-5f07-b4e8-02c2f4edd825"
+	cancelledEvent.UpdateID++
+	cancelledEvent.SourceKey += ":cancel"
+	cancelledOutcome := moderation.Outcome{
+		State:    moderation.DecidedPendingAction,
+		Input:    outcome.Input,
+		Signals:  outcome.Signals,
+		Decision: moderation.Decision{RiskScore: .95, DecisionConfidence: .95, EvidenceCoverage: 1, RecommendedAction: moderation.ActionDeleteMessage, AuthorizedAction: moderation.ActionDeleteMessage, AuthorizationReason: moderation.ReasonProfileChannelAdvertising},
+		Actions:  []moderation.ActionRequest{{Type: moderation.ActionDeleteMessage, Target: moderation.ActionTarget{Kind: moderation.TargetMessage, ChatID: -100777, UserID: 42, MessageID: 93}, IdempotencyKey: "cancel-profile-action", Notification: moderation.DeletionNotification{ChatID: 9001}}},
+	}
+	if err := store.RecordTerminal(ctx, cancelledEvent, cancelledOutcome); err != nil {
+		t.Fatal(err)
+	}
+	claimed, found, err = store.ClaimAction(ctx, "worker-cancel", 30*time.Second)
+	if err != nil || !found || claimed.AuthorizationReason != moderation.ReasonProfileChannelAdvertising {
+		t.Fatalf("claim cancellation: %+v %v %v", claimed, found, err)
+	}
+	if err := store.MarkActionCancelled(ctx, claimed, "profile-only deletion disabled"); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT a.status,e.terminal_state FROM moderation_actions a JOIN moderation_events e ON e.event_id=a.event_id WHERE a.action_id=$1`, claimed.ActionID).Scan(&actionStatus, &finalEventState); err != nil {
+		t.Fatal(err)
+	}
+	if actionStatus != "CANCELLED" || finalEventState != string(moderation.ProcessedReview) {
+		t.Fatalf("cancelled status = %s/%s", actionStatus, finalEventState)
+	}
+	var outboxCount, auditCount int
+	if err := pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM moderation_notification_outbox WHERE action_id=$1),(SELECT count(*) FROM moderation_audit_log WHERE action_id=$1 AND operation='ACTION_CANCELLED')`, claimed.ActionID).Scan(&outboxCount, &auditCount); err != nil {
+		t.Fatal(err)
+	}
+	if outboxCount != 0 || auditCount != 1 {
+		t.Fatalf("cancelled outbox/audit = %d/%d", outboxCount, auditCount)
+	}
 }
 
 func TestStoreObserveMessageCountsDuplicateAndFlood(t *testing.T) {

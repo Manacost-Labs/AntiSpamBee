@@ -25,12 +25,15 @@ var retryDelays = [...]time.Duration{
 	10 * time.Minute,
 }
 
+var errActionCancelled = errors.New("action cancelled by moderation policy")
+
 // Repository owns action leasing and durable state transitions.
 type Repository interface {
 	ClaimAction(context.Context, string, time.Duration) (moderation.ClaimedAction, bool, error)
 	MarkActionSucceeded(context.Context, moderation.ClaimedAction, bool) error
 	MarkActionRetryable(context.Context, moderation.ClaimedAction, time.Time, string) error
 	MarkActionPermanentFailure(context.Context, moderation.ClaimedAction, string) error
+	MarkActionCancelled(context.Context, moderation.ClaimedAction, string) error
 	ClaimNotification(context.Context, string, time.Duration) (moderation.ClaimedNotification, bool, error)
 	FinishNotification(context.Context, moderation.ClaimedNotification, string, time.Time, string) error
 	NotificationRecipientCurrent(context.Context, moderation.ClaimedNotification) (bool, error)
@@ -97,6 +100,9 @@ func (w *Worker) runActionOnce(ctx context.Context) (bool, error) {
 	}
 
 	assumed, err := w.execute(ctx, action)
+	if errors.Is(err, errActionCancelled) {
+		return true, w.repository.MarkActionCancelled(ctx, action, boundedError(err))
+	}
 	if err == nil {
 		if err := w.repository.MarkActionSucceeded(ctx, action, assumed); err != nil {
 			return true, fmt.Errorf("mark moderation action succeeded: %w", err)
@@ -195,6 +201,24 @@ func (w *Worker) execute(ctx context.Context, action moderation.ClaimedAction) (
 	target := action.Target
 	switch action.Type {
 	case moderation.ActionDeleteMessage:
+		// Cancel actions queued by the retired profile-only policy as well.
+		if action.AuthorizationReason == moderation.ReasonProfileChannelAdvertising {
+			return false, fmt.Errorf("%w: profile-only deletion is disabled", errActionCancelled)
+		}
+		// Older actions may contain Telegram's compatibility senders instead of
+		// the real author of a chat/channel message. Their rights cannot be checked.
+		if target.UserID <= 0 || target.UserID == 777000 || target.UserID == 1087968824 {
+			return false, fmt.Errorf("%w: message author identity is unavailable", errActionCancelled)
+		}
+		if target.UserID > 0 {
+			status, err := w.telegram.GetChatMemberStatus(ctx, target.ChatID, target.UserID)
+			if err != nil {
+				return false, fmt.Errorf("check message author before deletion: %w", err)
+			}
+			if status == "administrator" || status == "creator" {
+				return false, fmt.Errorf("%w: message author is an administrator", errActionCancelled)
+			}
+		}
 		return false, w.telegram.DeleteMessage(ctx, target.ChatID, target.MessageID)
 	case moderation.ActionDeleteReaction:
 		return false, w.telegram.DeleteMessageReaction(ctx, target.ChatID, target.MessageID, target.UserID)

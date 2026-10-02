@@ -31,7 +31,7 @@ func TestClientFetchProfileIncludesPersonalChannelPosts(t *testing.T) {
 		case r.URL.Path == "/botsecret/getChat" && body.ChatID == -1009001:
 			_, _ = w.Write([]byte(`{"ok":true,"result":{"id":-1009001,"type":"channel","title":"И там и здесь","username":"job_offer","description":"Нужны сотрудники на частичную занятость"}}`))
 		case r.URL.Path == "/botsecret/getUserPersonalChatMessages" && body.UserID == 8373323792 && body.Limit == 5:
-			_, _ = w.Write([]byte(`{"ok":true,"result":[{"message_id":1,"text":"Пишите в личку"},{"message_id":2,"caption":"Свободный график"}]}`))
+			_, _ = w.Write([]byte(`{"ok":true,"result":[{"message_id":1,"text":"Пишите в личку"},{"message_id":2,"caption":"Свободный график"},{"message_id":3,"audio":{"file_id":"song"}},{"message_id":4,"channel_chat_created":true}]}`))
 		default:
 			http.Error(w, "unexpected request", http.StatusBadRequest)
 		}
@@ -59,7 +59,7 @@ func TestClientFetchProfileIncludesPersonalChannelPosts(t *testing.T) {
 			Title:       "И там и здесь",
 			Username:    "job_offer",
 			Description: "Нужны сотрудники на частичную занятость",
-			RecentPosts: []string{"Пишите в личку", "Свободный график"},
+			RecentPosts: []string{"Пишите в личку", "Свободный график", ""},
 		},
 	}
 	if !reflect.DeepEqual(profile, want) {
