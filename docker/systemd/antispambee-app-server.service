@@ -1,0 +1,9 @@
+[Unit]
+Description=Relay AntiSpamBee requests to the local IndexPilot Codex bridge
+Wants=indexpilot-ai.service
+After=indexpilot-ai.service
+
+[Service]
+ExecStart=/usr/lib/systemd/systemd-socket-proxyd 127.0.0.1:8787
+DynamicUser=yes
+NoNewPrivileges=yes

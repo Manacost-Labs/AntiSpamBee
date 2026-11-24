@@ -64,6 +64,13 @@ func run(ctx context.Context, config config) error {
 			if err != nil {
 				return err
 			}
+			if config.AppServerContentModel != "" {
+				content, err = openrouter.NewAppServerContentClient(config.AppServerSocket, config.AppServerTokenFile, config.AppServerContentModel, content)
+				if err != nil {
+					return err
+				}
+				slog.Info("using Codex App Server for content classification", "model", config.AppServerContentModel, "fallback_model", config.OpenRouterContentModel)
+			}
 			semanticOptions = append(semanticOptions, moderation.WithContentAnalyzer(content, profiles, config.OpenRouterContentChatID))
 			if config.AdvertisingAutobanChatID != 0 {
 				clientConfig.Model = config.OpenRouterBanModel

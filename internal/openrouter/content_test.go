@@ -3,12 +3,16 @@ package openrouter
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"antispambee/internal/detection"
 )
@@ -113,12 +117,93 @@ func TestContentDistinguishesTransientOutages(t *testing.T) {
 	}
 }
 
+func TestAppServerContentFallback(t *testing.T) {
+	dir := t.TempDir()
+	socket := filepath.Join(dir, "bridge.sock")
+	tokenFile := filepath.Join(dir, "token")
+	if err := os.WriteFile(tokenFile, []byte("bridge-token\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var unavailable atomic.Bool
+	const verdicts = `{"message":{"verdict":"other","source":"","evidence":""},"profile":{"verdict":"other","source":"","evidence":""}}`
+	writeVerdict := func(w http.ResponseWriter, model string) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"model": model, "choices": []map[string]any{
+			{"finish_reason": "stop", "message": map[string]string{"content": verdicts}},
+		}})
+	}
+	bridge := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/chat/completions" || r.Header.Get("Authorization") != "Bearer bridge-token" {
+			t.Error("wrong local endpoint or authorization")
+		}
+		var body map[string]json.RawMessage
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Error(err)
+		}
+		if string(body["model"]) != `"sol"` || len(body["output_schema"]) == 0 || len(body["response_format"]) != 0 ||
+			!strings.Contains(string(body["messages"]), "data:image/png;base64,") {
+			t.Error("the bridge needs a structured schema and the original image")
+		}
+		if unavailable.Load() {
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		writeVerdict(w, "sol")
+	})}
+	t.Cleanup(func() { _ = bridge.Close() })
+	go func() { _ = bridge.Serve(listener) }()
+	var fallbackCalls atomic.Int32
+	backupServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fallbackCalls.Add(1)
+		if r.URL.Path != "/api/v1/chat/completions" || r.Header.Get("Authorization") != "Bearer backup-token" {
+			t.Error("wrong fallback endpoint or authorization")
+		}
+		writeVerdict(w, "backup")
+	}))
+	defer backupServer.Close()
+	backup, err := NewClient(ClientConfig{APIKey: "backup-token", BaseURL: backupServer.URL, Model: "backup"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := NewAppServerContentClient(socket, tokenFile, "sol", backup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	client.now = func() time.Time { return now }
+	input := detection.SemanticAdContent{Image: []byte("\x89PNG\r\n\x1a\nmock")}
+	if signals := client.AnalyzeContent(context.Background(), input); len(signals) != 2 || signals[0].ResolvedModel != "sol" || fallbackCalls.Load() != 0 {
+		t.Fatalf("healthy app server did not handle the request alone: %+v", signals)
+	}
+	unavailable.Store(true)
+	if signals := client.AnalyzeContent(context.Background(), input); len(signals) != 2 || signals[0].ResolvedModel != "backup" || fallbackCalls.Load() != 1 {
+		t.Fatalf("fallback did not classify the image: %+v", signals)
+	}
+	unavailable.Store(false)
+	if signals := client.AnalyzeContent(context.Background(), input); len(signals) != 2 || signals[0].ResolvedModel != "backup" || fallbackCalls.Load() != 2 {
+		t.Fatalf("fallback was not used during the retry delay: %+v", signals)
+	}
+	now = now.Add(appServerRetryDelay)
+	if signals := client.AnalyzeContent(context.Background(), input); len(signals) != 2 || signals[0].ResolvedModel != "sol" || fallbackCalls.Load() != 2 {
+		t.Fatalf("app server was not retried when the delay elapsed: %+v", signals)
+	}
+}
+
 func TestAnalyzeContentLive(t *testing.T) {
 	model := os.Getenv("ANTISPAMBEE_CONTENT_LIVE_MODEL")
 	if model == "" {
-		t.Skip("set ANTISPAMBEE_CONTENT_LIVE_MODEL to exercise the OpenRouter API")
+		t.Skip("set ANTISPAMBEE_CONTENT_LIVE_MODEL to exercise a live content backend")
 	}
-	client, err := NewClient(ClientConfig{APIKey: os.Getenv("OPENROUTER_API_KEY"), BaseURL: os.Getenv("OPENROUTER_BASE_URL"), Model: model})
+	var client *Client
+	var err error
+	if socket := os.Getenv("ANTISPAMBEE_CONTENT_LIVE_SOCKET"); socket != "" {
+		client, err = NewAppServerContentClient(socket, os.Getenv("ANTISPAMBEE_CONTENT_LIVE_TOKEN_FILE"), model, nil)
+	} else {
+		client, err = NewClient(ClientConfig{APIKey: os.Getenv("OPENROUTER_API_KEY"), BaseURL: os.Getenv("OPENROUTER_BASE_URL"), Model: model})
+	}
 	if err != nil {
 		t.Fatal(err)
 	}

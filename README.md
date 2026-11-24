@@ -166,6 +166,14 @@ JEV оценивает текст, подпись и OCR сообщения. Д�
 удаление комментариев в `STRICT`; явная реклама в сообщении доступна также
 в `STANDARD`.
 
+На хосте с `indexpilot-ai.service` можно назначить Sol основной моделью для текста,
+изображений и публичного профиля. Установите оба файла `docker/systemd/antispambee-app-server.*`
+в `/etc/systemd/system/`, выполните `systemctl daemon-reload` и
+`systemctl enable --now antispambee-app-server.socket`. Используйте `compose.app-server.yml`
+вместе с `compose.prod.yml` и передайте `APP_SERVER_BRIDGE_GID` с GID группы `indexpilot-ai`.
+`OPENROUTER_CONTENT_MODEL` служит резервом при ошибке моста, а `OPENROUTER_BAN_MODEL`
+задаёт отдельную модель подтверждения. Контейнер читает токен из файла моста.
+
 `AUTOBAN_ADVERTISING_CHAT_ID` включает бан за подтверждённую рекламу в выбранной
 группе в режиме `STRICT` при включённом автобане. Если локальным детекторам
 достаточно доказательств, бот сразу ставит в очередь удаление и бан. Если вывод

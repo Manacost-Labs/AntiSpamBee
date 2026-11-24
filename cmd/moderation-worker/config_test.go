@@ -1,9 +1,36 @@
 package main
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestLoadConfigAppServerNeedsFallbackAndIndependentConfirmation(t *testing.T) {
+	values := map[string]string{
+		"DATABASE_URL":                "postgres://localhost/db",
+		"TELEGRAM_BOT_TOKEN":          "123456:secret",
+		"OPENROUTER_API_KEY":          "mock",
+		"APP_SERVER_CONTENT_MODEL":    "gpt-6.2-sol",
+		"APP_SERVER_SOCKET":           "/run/bridge.sock",
+		"APP_SERVER_TOKEN_FILE":       "/run/secrets/bridge",
+		"AUTOBAN_ADVERTISING_CHAT_ID": "-10001",
+	}
+	getenv := func(key string) string { return values[key] }
+	if _, err := loadConfig(getenv); err == nil || !strings.Contains(err.Error(), "as a fallback") {
+		t.Fatalf("expected the missing fallback to be rejected, got %v", err)
+	}
+	values["OPENROUTER_CONTENT_MODEL"] = "google/gemini-3-flash-preview"
+	values["OPENROUTER_BAN_MODEL"] = "openai/gpt-6.2-sol"
+	if _, err := loadConfig(getenv); err == nil || !strings.Contains(err.Error(), "must differ from APP_SERVER_CONTENT_MODEL") {
+		t.Fatalf("expected a shared primary and confirmation model to be rejected, got %v", err)
+	}
+	values["OPENROUTER_BAN_MODEL"] = "anthropic/claude-sonnet-4.6"
+	cfg, err := loadConfig(getenv)
+	if err != nil || cfg.AppServerContentModel != "gpt-6.2-sol" {
+		t.Fatalf("unable to enable the App Server model: %v", err)
+	}
+}
 
 func TestLoadConfigUsesSafeDefaults(t *testing.T) {
 	values := map[string]string{

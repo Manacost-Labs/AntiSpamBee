@@ -1,0 +1,22 @@
+# Optional production override for the host's IndexPilot Codex bridge.
+services:
+  moderation-worker:
+    group_add:
+      - "${APP_SERVER_BRIDGE_GID:?Set APP_SERVER_BRIDGE_GID to the host indexpilot-ai group ID}"
+    environment:
+      APP_SERVER_CONTENT_MODEL: ${APP_SERVER_CONTENT_MODEL:-gpt-6.2-sol}
+      APP_SERVER_SOCKET: /run/antispambee-app-server/bridge.sock
+      APP_SERVER_TOKEN_FILE: /run/secrets/antispambee_app_server_token
+    volumes:
+      - type: bind
+        source: /run/antispambee-app-server
+        target: /run/antispambee-app-server
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /etc/indexpilot-ai/token
+        target: /run/secrets/antispambee_app_server_token
+        read_only: true
+        bind:
+          create_host_path: false

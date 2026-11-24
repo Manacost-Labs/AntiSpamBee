@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -14,6 +15,9 @@ type config struct {
 	OpenRouterModel            string
 	OpenRouterContentModel     string
 	OpenRouterContentChatID    int64
+	AppServerContentModel      string
+	AppServerSocket            string
+	AppServerTokenFile         string
 	AdvertisingAutobanChatID   int64
 	OpenRouterBanModel         string
 	ModerationOperationsChatID int64
@@ -45,6 +49,12 @@ func loadConfig(getenv func(string) string) (config, error) {
 	if openRouterContentModel != "" && openRouterAPIKey == "" {
 		return config{}, fmt.Errorf("OPENROUTER_API_KEY is required for OPENROUTER_CONTENT_MODEL")
 	}
+	appServerContentModel := strings.TrimSpace(getenv("APP_SERVER_CONTENT_MODEL"))
+	appServerSocket := getenv("APP_SERVER_SOCKET")
+	appServerTokenFile := getenv("APP_SERVER_TOKEN_FILE")
+	if appServerContentModel != "" && (appServerSocket == "" || appServerTokenFile == "" || openRouterContentModel == "") {
+		return config{}, fmt.Errorf("APP_SERVER_CONTENT_MODEL requires APP_SERVER_SOCKET, APP_SERVER_TOKEN_FILE and OPENROUTER_CONTENT_MODEL as a fallback")
+	}
 	var openRouterContentChatID int64
 	if chatID := getenv("OPENROUTER_CONTENT_CHAT_ID"); chatID != "" {
 		parsed, err := strconv.ParseInt(chatID, 10, 64)
@@ -70,6 +80,9 @@ func loadConfig(getenv func(string) string) (config, error) {
 		}
 		if openRouterBanModel == openRouterContentModel {
 			return config{}, fmt.Errorf("OPENROUTER_BAN_MODEL must differ from OPENROUTER_CONTENT_MODEL")
+		}
+		if appServerContentModel != "" && strings.TrimPrefix(openRouterBanModel, "openai/") == appServerContentModel {
+			return config{}, fmt.Errorf("OPENROUTER_BAN_MODEL must differ from APP_SERVER_CONTENT_MODEL")
 		}
 		advertisingAutobanChatID = parsed
 	}
@@ -114,6 +127,9 @@ func loadConfig(getenv func(string) string) (config, error) {
 		OpenRouterModel:            valueOrDefault(getenv("OPENROUTER_MODEL"), "~typesafe/jev-latest"),
 		OpenRouterContentModel:     openRouterContentModel,
 		OpenRouterContentChatID:    openRouterContentChatID,
+		AppServerContentModel:      appServerContentModel,
+		AppServerSocket:            appServerSocket,
+		AppServerTokenFile:         appServerTokenFile,
 		AdvertisingAutobanChatID:   advertisingAutobanChatID,
 		OpenRouterBanModel:         openRouterBanModel,
 		ModerationOperationsChatID: moderationOperationsChatID,

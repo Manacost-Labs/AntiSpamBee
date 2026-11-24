@@ -1,0 +1,11 @@
+[Unit]
+Description=Private socket for the AntiSpamBee Codex bridge
+
+[Socket]
+ListenStream=/run/antispambee-app-server/bridge.sock
+SocketMode=0660
+SocketGroup=indexpilot-ai
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

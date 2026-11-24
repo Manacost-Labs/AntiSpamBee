@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"antispambee/internal/detection"
@@ -28,13 +29,16 @@ type ClientConfig struct {
 	HTTPClient *http.Client
 }
 
-// Client evaluates text-only Telegram context with TypeSafe Jev.
+// Client evaluates Telegram content through a configured classification backend.
 type Client struct {
-	apiKey     string
-	baseURL    string
-	model      string
-	httpClient *http.Client
-	now        func() time.Time
+	apiKey              string
+	baseURL             string
+	model               string
+	httpClient          *http.Client
+	now                 func() time.Time
+	appServer           bool
+	contentFallback     *Client
+	retryAppServerAfter atomic.Int64
 }
 
 // NewClient creates an OpenRouter Decisions API client.

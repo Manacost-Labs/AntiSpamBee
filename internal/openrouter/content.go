@@ -41,6 +41,9 @@ type contentImage struct {
 // AnalyzeContent evaluates the current message and the public profile in one
 // request, then checks that evidence belongs to the corresponding input.
 func (c *Client) AnalyzeContent(ctx context.Context, input detection.SemanticAdContent) []detection.Signal {
+	if c.contentFallback != nil && c.now().UnixNano() < c.retryAppServerAfter.Load() {
+		return c.contentFallback.AnalyzeContent(ctx, input)
+	}
 	sources := contentSources(input)
 	images := contentImages(input)
 	if len(sources) == 0 && len(images) == 0 {
@@ -48,6 +51,10 @@ func (c *Client) AnalyzeContent(ctx context.Context, input detection.SemanticAdC
 	}
 	verdicts, model, err := c.classifyContent(ctx, sources, input.Message.HasLink, images)
 	if err != nil {
+		if c.contentFallback != nil && ctx.Err() == nil {
+			c.retryAppServerAfter.Store(c.now().Add(appServerRetryDelay).UnixNano())
+			return c.contentFallback.AnalyzeContent(ctx, input)
+		}
 		reasons := []string{detection.ReasonOpenRouterFailed}
 		var status contentHTTPError
 		var transport *url.Error
@@ -70,7 +77,7 @@ func (c *Client) AnalyzeContent(ctx context.Context, input detection.SemanticAdC
 type contentHTTPError struct{ code int }
 
 func (err contentHTTPError) Error() string {
-	return fmt.Sprintf("OpenRouter classification HTTP %d", err.code)
+	return fmt.Sprintf("content classification HTTP %d", err.code)
 }
 
 func contentSources(input detection.SemanticAdContent) map[string]string {
@@ -216,21 +223,30 @@ func (c *Client) classifyContent(ctx context.Context, sources map[string]string,
 			"evidence": map[string]string{"type": "string"},
 		},
 	}
-	payload, err := json.Marshal(map[string]any{
-		"model": c.model, "temperature": 0, "max_tokens": 650,
-		"provider": map[string]any{"require_parameters": true, "data_collection": "deny", "zdr": true},
-		"messages": []map[string]any{{"role": "system", "content": contentPolicy}, {"role": "user", "content": parts}},
-		"response_format": map[string]any{"type": "json_schema", "json_schema": map[string]any{
-			"name": "advertising_verdicts", "strict": true, "schema": map[string]any{
-				"type": "object", "additionalProperties": false, "required": []string{"message", "profile"},
-				"properties": map[string]any{"message": verdictSchema, "profile": verdictSchema},
-			},
-		}},
-	})
+	schema := map[string]any{
+		"type": "object", "additionalProperties": false, "required": []string{"message", "profile"},
+		"properties": map[string]any{"message": verdictSchema, "profile": verdictSchema},
+	}
+	parameters := map[string]any{
+		"model": c.model, "messages": []map[string]any{{"role": "system", "content": contentPolicy}, {"role": "user", "content": parts}},
+	}
+	path := "/api/v1/chat/completions"
+	if c.appServer {
+		path = "/v1/chat/completions"
+		parameters["output_schema"] = schema
+	} else {
+		parameters["temperature"] = 0
+		parameters["max_tokens"] = 650
+		parameters["provider"] = map[string]any{"require_parameters": true, "data_collection": "deny", "zdr": true}
+		parameters["response_format"] = map[string]any{"type": "json_schema", "json_schema": map[string]any{
+			"name": "advertising_verdicts", "strict": true, "schema": schema,
+		}}
+	}
+	payload, err := json.Marshal(parameters)
 	if err != nil {
 		return contentVerdicts{}, "", err
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/v1/chat/completions", bytes.NewReader(payload))
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, bytes.NewReader(payload))
 	if err != nil {
 		return contentVerdicts{}, "", err
 	}
@@ -257,7 +273,7 @@ func (c *Client) classifyContent(ctx context.Context, sources map[string]string,
 		return contentVerdicts{}, "", err
 	}
 	if len(result.Choices) != 1 || result.Choices[0].FinishReason != "stop" {
-		return contentVerdicts{}, "", fmt.Errorf("OpenRouter classification returned no complete result")
+		return contentVerdicts{}, "", fmt.Errorf("content classification returned no complete result")
 	}
 	var verdicts contentVerdicts
 	if err := json.Unmarshal([]byte(result.Choices[0].Message.Content), &verdicts); err != nil {
