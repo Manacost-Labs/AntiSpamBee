@@ -33,6 +33,8 @@ type messageStub struct {
 
 func (m *messageStub) Data() []byte { return m.data }
 
+func (m *messageStub) InProgress() error { return nil }
+
 func (m *messageStub) DoubleAck(context.Context) error {
 	m.ackCount++
 	*m.operations = append(*m.operations, "ack")

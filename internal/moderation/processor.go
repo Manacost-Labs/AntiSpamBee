@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -14,6 +15,8 @@ import (
 	"antispambee/internal/events"
 	"antispambee/internal/telegramapi"
 )
+
+var ErrContentUnavailable = errors.New("multimodal moderation temporarily unavailable")
 
 // TerminalState records the durable outcome of moderation processing.
 type TerminalState string
@@ -31,12 +34,14 @@ const (
 
 // Outcome groups the terminal state and the evidence that produced it.
 type Outcome struct {
-	State    TerminalState
-	Input    InputFeatures
-	Signals  []detection.Signal
-	Decision Decision
-	Actions  []ActionRequest
-	Evidence *Evidence
+	State       TerminalState
+	Input       InputFeatures
+	Signals     []detection.Signal
+	Decision    Decision
+	Actions     []ActionRequest
+	Evidence    *Evidence
+	Command     *CommandCommit
+	QueueReview bool
 }
 
 // InputFeatures stores privacy-safe metadata needed to audit missed content.
@@ -75,6 +80,12 @@ type profileDetector interface {
 type semanticAdAnalyzer interface {
 	AnalyzeAdvertising(context.Context, detection.SemanticAdContent) detection.Signal
 }
+type contentAdAnalyzer interface {
+	AnalyzeContent(context.Context, detection.SemanticAdContent) []detection.Signal
+}
+type imageDownloader interface {
+	DownloadFile(context.Context, string, int64) ([]byte, error)
+}
 
 type imageTextExtractor interface {
 	ExtractText(context.Context, string) (string, error)
@@ -98,6 +109,18 @@ func WithSemanticAnalyzer(analyzer semanticAdAnalyzer) ProcessorOption {
 			return fmt.Errorf("semantic ad analyzer must not be nil")
 		}
 		processor.semantic = analyzer
+		return nil
+	}
+}
+
+func WithContentAnalyzer(analyzer contentAdAnalyzer, downloader imageDownloader, chatID int64) ProcessorOption {
+	return func(processor *Processor) error {
+		if analyzer == nil || downloader == nil {
+			return fmt.Errorf("content analyzer and image downloader are required")
+		}
+		processor.content = analyzer
+		processor.images = downloader
+		processor.contentChatID = chatID
 		return nil
 	}
 }
@@ -135,20 +158,28 @@ func WithPolicyStore(store policyStore) ProcessorOption {
 
 // Processor enriches events, evaluates profile risk, and records an outcome.
 type Processor struct {
-	store         terminalRecorder
-	profiles      telegramClient
-	detector      profileDetector
-	messages      *detection.MessageAdDetector
-	channels      *detection.AdvertisingChannelDetector
-	imageText     imageTextExtractor
-	semantic      semanticAdAnalyzer
-	decisions     *DecisionEngine
-	behaviorStore behaviorStore
-	behavior      *detection.BehaviorDetector
-	policyStore   policyStore
+	store              terminalRecorder
+	profiles           telegramClient
+	detector           profileDetector
+	messages           *detection.MessageAdDetector
+	channels           *detection.AdvertisingChannelDetector
+	imageText          imageTextExtractor
+	semantic           semanticAdAnalyzer
+	content            contentAdAnalyzer
+	images             imageDownloader
+	contentChatID      int64
+	advertisingBanChat int64
+	banVerifier        contentAdAnalyzer
+	operationsChatID   int64
+	campaignKey        []byte
+	campaigns          campaignStore
+	decisions          *DecisionEngine
+	behaviorStore      behaviorStore
+	behavior           *detection.BehaviorDetector
+	policyStore        policyStore
 }
 
-// NewProcessor constructs the moderation processor with automatic deletion.
+// NewProcessor constructs the moderation processor with automatic moderation.
 func NewProcessor(
 	store terminalRecorder,
 	profiles telegramClient,
@@ -188,12 +219,16 @@ func NewProcessor(
 func (p *Processor) Process(ctx context.Context, event events.TelegramUpdate) error {
 	message := messageContent(event.Payload)
 	messageSignal := p.messages.Analyze(message)
+	target := moderationTargetFrom(event.Payload)
+	useContent := p.content != nil && (p.contentChatID == 0 || p.contentChatID == target.ChatID)
+	attachment := imageAttachment(event.Payload)
+	fileID := attachment.BestImageFileID(0)
 	var ocrFailureSignal *detection.Signal
 	if p.imageText != nil && signalScore(messageSignal) < 0.90 {
-		if fileID := imageFileID(event.Payload); fileID != "" {
+		if fileID != "" {
 			ocrText, err := p.imageText.ExtractText(ctx, fileID)
 			if err != nil {
-				if isRetryableProfileError(err) {
+				if !useContent && isRetryableProfileError(err) {
 					return fmt.Errorf("extract Telegram image text: %w", err)
 				}
 				signal := ocrErrorSignal()
@@ -207,7 +242,6 @@ func (p *Processor) Process(ctx context.Context, event events.TelegramUpdate) er
 	profileSignal := p.detector.Analyze(detection.Profile{})
 	profileContext := detection.Profile{}
 	var profileFetchErr error
-	target := moderationTargetFrom(event.Payload)
 	userID := target.UserID
 	if userID == 0 {
 		profileSignal.ReasonCodes = []string{detection.ReasonNoSender}
@@ -222,12 +256,13 @@ func (p *Processor) Process(ctx context.Context, event events.TelegramUpdate) er
 			profileSignal = p.detector.Analyze(profile)
 		}
 	}
-	signals := []detection.Signal{messageSignal, profileSignal, p.channels.Analyze(profileContext)}
+	channelSignal := p.channels.Analyze(profileContext)
+	signals := []detection.Signal{messageSignal, profileSignal, channelSignal, p.channels.AnalyzeProhibited(profileContext)}
 	if ocrFailureSignal != nil {
 		signals = append(signals, *ocrFailureSignal)
 	}
 	actionTarget := target.actionTarget()
-	if p.behaviorStore != nil && actionTarget.Kind == TargetMessage &&
+	if p.behaviorStore != nil && actionTarget.Kind == TargetMessage && actionTarget.UserID > 0 &&
 		(message.Text != "" || message.Caption != "") {
 		stats, err := p.behaviorStore.ObserveMessage(ctx, event, actionTarget, message)
 		if err != nil {
@@ -236,13 +271,49 @@ func (p *Processor) Process(ctx context.Context, event events.TelegramUpdate) er
 			signals = append(signals, p.behavior.Analyze(stats))
 		}
 	}
-	if p.semantic != nil {
-		signals = append(signals, p.semantic.AnalyzeAdvertising(ctx, detection.SemanticAdContent{
-			Message: message,
-			Profile: profileContext,
-		}))
-	}
+	knownMessageAuthor := actionTarget.Kind == TargetMessage && actionTarget.UserID > 0
+	confirmedOffer := knownMessageAuthor &&
+		signalScore(messageSignal) >= .90 && messageSignal.EvidenceCoverage >= .50 &&
+		(slices.Contains(messageSignal.ReasonCodes, detection.ReasonRecruitmentSpam) ||
+			slices.Contains(messageSignal.ReasonCodes, detection.ReasonEducationDocumentOffer))
+	confirmedEducationChannel := knownMessageAuthor && signalScore(channelSignal) >= .90 && channelSignal.EvidenceCoverage >= .50 &&
+		slices.Contains(channelSignal.ReasonCodes, detection.ReasonEducationDocumentOffer)
 	hasMessageContent := strings.TrimSpace(message.Text+message.Caption+message.OCRText) != ""
+	useSemantic := (p.semantic != nil || useContent) && !confirmedOffer
+	var checkedContent *detection.SemanticAdContent
+	addSemanticSignal := func() {
+		input := detection.SemanticAdContent{Message: message, Profile: profileContext}
+		if !useContent {
+			signals = append(signals, p.semantic.AnalyzeAdvertising(ctx, input))
+			return
+		}
+		if imageID := attachment.BestImageFileID(detection.MaxSemanticImageBytes); imageID != "" {
+			image, err := p.images.DownloadFile(ctx, imageID, detection.MaxSemanticImageBytes)
+			if err != nil {
+				signal := ocrErrorSignal()
+				signal.Detector = "image.download"
+				signal.DetectorVersion = "telegram-file-v1"
+				signal.ReasonCodes = []string{detection.ReasonSemanticImageUnavailable}
+				ocrFailureSignal = &signal
+				signals = append(signals, signal)
+			} else {
+				input.Image = image
+				hasMessageContent = hasMessageContent || len(image) > 0
+			}
+		}
+		input.ProfileImages = p.profileImages(ctx, profileContext.PersonalChannel)
+		checkedContent = &input
+		results := p.content.AnalyzeContent(ctx, input)
+		signals = append(signals, results...)
+		if p.semantic != nil && slices.ContainsFunc(results, func(signal detection.Signal) bool {
+			return signal.Status == detection.StatusError
+		}) {
+			signals = append(signals, p.semantic.AnalyzeAdvertising(ctx, input))
+		}
+	}
+	if useSemantic && !confirmedEducationChannel {
+		addSemanticSignal()
+	}
 	preliminary := p.decisions.Decide(DecisionInput{Target: actionTarget, Signals: signals, HasMessageContent: hasMessageContent})
 	if profileFetchErr != nil && preliminary.RiskScore < 0.90 && isRetryableProfileError(profileFetchErr) {
 		return fmt.Errorf("fetch Telegram profile for moderation: %w", profileFetchErr)
@@ -252,7 +323,15 @@ func (p *Processor) Process(ctx context.Context, event events.TelegramUpdate) er
 	autobanDisabled := false
 	moderatorChatID := int64(0)
 	policy := CommunityPolicy{ChatID: target.ChatID, ProtectionLevel: "STRICT", AutomaticActionsEnabled: true, AutobanEnabled: true}
-	if preliminary.AuthorizedAction != ActionAllow {
+	operations := p.operationsChatID != 0 && target.ChatID == p.operationsChatID && knownMessageAuthor
+	var indicators []CampaignIndicator
+	if operations && !detection.IsPromotionWarning(message.Text+" "+message.Caption+" "+message.OCRText) {
+		indicators = campaignIndicators(p.campaignKey, message, attachment.StableImageID())
+	}
+	needsReviewPolicy := operations && (len(indicators) > 0 || ocrFailureSignal != nil || slices.ContainsFunc(signals, func(signal detection.Signal) bool {
+		return signal.Detector == detection.SemanticMessageDetector && signal.Status == detection.StatusError
+	}))
+	if preliminary.AuthorizedAction != ActionAllow || needsReviewPolicy {
 		if p.policyStore != nil {
 			var err error
 			policy, err = p.policyStore.GetCommunityPolicy(ctx, event.TenantID, target.ChatID, target.UserID)
@@ -266,10 +345,15 @@ func (p *Processor) Process(ctx context.Context, event events.TelegramUpdate) er
 					return fmt.Errorf("check authorized Telegram sender chat: %w", err)
 				}
 			}
-			automaticActionsDisabled = !policy.AutomaticActionsEnabled || policy.ProtectionLevel == "OBSERVE"
+			automaticActionsDisabled = !policy.AutomaticActionsEnabled ||
+				(policy.ProtectionLevel != "STANDARD" && policy.ProtectionLevel != "STRICT")
 			autobanDisabled = !policy.AutobanEnabled
 			moderatorChatID = policy.ModeratorChatID
 		}
+	}
+	// Channel evidence can authorize deletion only under STRICT policy.
+	if useSemantic && confirmedEducationChannel && (policy.ProtectionLevel != "STRICT" || automaticActionsDisabled) {
+		addSemanticSignal()
 	}
 	decisionInput := DecisionInput{
 		Target:                          actionTarget,
@@ -290,11 +374,44 @@ func (p *Processor) Process(ctx context.Context, event events.TelegramUpdate) er
 		decisionInput.IsProtected = status == "creator" || status == "administrator"
 	}
 	decision := p.decisions.Decide(decisionInput)
+	if useContent && actionTarget.Kind == TargetMessage && decision.AuthorizedAction == ActionAllow {
+		for _, signal := range signals {
+			if signal.Detector != detection.SemanticMessageDetector || signal.Status != detection.StatusError {
+				continue
+			}
+			if target.MessageDate > 0 && time.Since(time.Unix(target.MessageDate, 0)) < 45*time.Second &&
+				slices.Contains(signal.ReasonCodes, detection.ReasonOpenRouterTemporarilyUnavailable) {
+				return ErrContentUnavailable
+			}
+			decision.RecommendedAction = ActionReview
+			decision.AuthorizedAction = ActionReview
+			decision.AuthorizationReason = detection.ReasonOpenRouterFailed
+			break
+		}
+	}
+	decision, confirmation := p.verifyAdvertisingAction(ctx, decision, decisionInput, checkedContent)
+	signals = append(signals, confirmation...)
 	isProtected = decisionInput.IsProtected
 	if ocrFailureSignal != nil && decision.RiskScore < 0.90 {
 		decision.RecommendedAction = ActionReview
 		decision.AuthorizedAction = ActionReview
 		decision.AuthorizationReason = ReasonInsufficientEvidence
+	}
+	if len(indicators) > 0 && !isProtected {
+		kinds, err := p.campaigns.ObserveCampaign(ctx, event.TenantID, actionTarget, indicators, isAutomaticAction(decision.AuthorizedAction))
+		if err != nil {
+			return fmt.Errorf("observe advertising campaign: %w", err)
+		}
+		if len(kinds) > 0 && !isAutomaticAction(decision.AuthorizedAction) {
+			decision.RecommendedAction = ActionReview
+			decision.AuthorizedAction = ActionReview
+			decision.AuthorizationReason = ReasonRepeatedCampaign
+			score, confidence := .60, .70
+			signals = append(signals, detection.Signal{SchemaVersion: "1", Detector: "behavior.campaign", DetectorVersion: "v1",
+				Category: "spam.behavior", Status: detection.StatusAvailable, Severity: detection.SeverityMedium,
+				Score: &score, Confidence: &confidence, EvidenceCoverage: 1, ReasonCodes: []string{ReasonRepeatedCampaign},
+				MatchedRules: kinds, CreatedAt: time.Now().UTC()})
+		}
 	}
 	state := terminalStateFor(decision.AuthorizedAction)
 	actions := []ActionRequest{}
@@ -315,12 +432,13 @@ func (p *Processor) Process(ctx context.Context, event events.TelegramUpdate) er
 		evidence.EvaluationSample = sampled
 	}
 	if err := p.store.RecordTerminal(ctx, event, Outcome{
-		State:    state,
-		Input:    inputFeatures(event.Payload, message),
-		Signals:  signals,
-		Decision: decision,
-		Actions:  actions,
-		Evidence: evidence,
+		State:       state,
+		Input:       inputFeatures(event.Payload, message),
+		Signals:     signals,
+		Decision:    decision,
+		Actions:     actions,
+		Evidence:    evidence,
+		QueueReview: operations && decision.AuthorizedAction == ActionReview,
 	}); err != nil {
 		return fmt.Errorf("record terminal moderation state: %w", err)
 	}
@@ -348,52 +466,48 @@ func signalScore(signal detection.Signal) float64 {
 	return *signal.Score
 }
 
-func imageFileID(payload json.RawMessage) string {
-	type photoSize struct {
-		FileID   string `json:"file_id"`
-		FileSize int64  `json:"file_size"`
+func (p *Processor) profileImages(ctx context.Context, channel *detection.PersonalChannel) []detection.ProfileImage {
+	if channel == nil || channel.Username == "" {
+		return nil
 	}
-	type document struct {
-		FileID   string `json:"file_id"`
-		MimeType string `json:"mime_type"`
+	var images []detection.ProfileImage
+	attempts := 0
+	for index, fileID := range channel.RecentPostImageIDs {
+		if fileID == "" {
+			continue
+		}
+		if attempts == detection.MaxProfileImages {
+			break
+		}
+		attempts++
+		if image, err := p.images.DownloadFile(ctx, fileID, detection.MaxProfileImageBytes); err == nil && len(image) > 0 {
+			images = append(images, detection.ProfileImage{PostNumber: index + 1, Data: image})
+		}
 	}
-	type mediaMessage struct {
-		Photo    []photoSize `json:"photo"`
-		Document *document   `json:"document"`
-	}
+	return images
+}
+
+func imageAttachment(payload json.RawMessage) *telegramapi.ImageAttachment {
 	var update struct {
-		Message               *mediaMessage `json:"message"`
-		EditedMessage         *mediaMessage `json:"edited_message"`
-		BusinessMessage       *mediaMessage `json:"business_message"`
-		EditedBusinessMessage *mediaMessage `json:"edited_business_message"`
-		ChannelPost           *mediaMessage `json:"channel_post"`
-		EditedChannelPost     *mediaMessage `json:"edited_channel_post"`
+		Message               *telegramapi.ImageAttachment `json:"message"`
+		EditedMessage         *telegramapi.ImageAttachment `json:"edited_message"`
+		BusinessMessage       *telegramapi.ImageAttachment `json:"business_message"`
+		EditedBusinessMessage *telegramapi.ImageAttachment `json:"edited_business_message"`
+		ChannelPost           *telegramapi.ImageAttachment `json:"channel_post"`
+		EditedChannelPost     *telegramapi.ImageAttachment `json:"edited_channel_post"`
 	}
 	if json.Unmarshal(payload, &update) != nil {
-		return ""
+		return nil
 	}
-	for _, message := range []*mediaMessage{
+	for _, message := range []*telegramapi.ImageAttachment{
 		update.Message, update.EditedMessage, update.BusinessMessage,
 		update.EditedBusinessMessage, update.ChannelPost, update.EditedChannelPost,
 	} {
-		if message == nil {
-			continue
+		if message != nil {
+			return message
 		}
-		var selected photoSize
-		for index, photo := range message.Photo {
-			if photo.FileID != "" && (selected.FileID == "" || photo.FileSize >= selected.FileSize || index == len(message.Photo)-1) {
-				selected = photo
-			}
-		}
-		if selected.FileID != "" {
-			return selected.FileID
-		}
-		if message.Document != nil && message.Document.FileID != "" && strings.HasPrefix(strings.ToLower(message.Document.MimeType), "image/") {
-			return message.Document.FileID
-		}
-		return ""
 	}
-	return ""
+	return nil
 }
 
 func inputFeatures(payload json.RawMessage, content detection.MessageContent) InputFeatures {
@@ -697,6 +811,7 @@ type moderationTarget struct {
 	ChatID             int64
 	UserID             int64
 	MessageID          int64
+	MessageDate        int64
 	ChatType           string
 	SenderChatID       int64
 	IsAutomaticForward bool
@@ -730,6 +845,8 @@ func moderationTargetFrom(payload json.RawMessage) moderationTarget {
 	}
 	type message struct {
 		MessageID          int64   `json:"message_id"`
+		Date               int64   `json:"date"`
+		EditDate           int64   `json:"edit_date"`
 		From               *sender `json:"from"`
 		Chat               *chat   `json:"chat"`
 		SenderChat         *chat   `json:"sender_chat"`
@@ -785,6 +902,7 @@ func moderationTargetFrom(payload json.RawMessage) moderationTarget {
 		if candidate != nil {
 			target := targetFrom(candidate.Chat, candidate.From, candidate.SenderChat, candidate.MessageID, TargetMessage)
 			target.IsAutomaticForward = candidate.IsAutomaticForward
+			target.MessageDate = max(candidate.Date, candidate.EditDate)
 			return target
 		}
 	}

@@ -3,6 +3,7 @@ package moderation
 import (
 	"fmt"
 	"math"
+	"slices"
 	"strings"
 
 	"antispambee/internal/detection"
@@ -31,19 +32,23 @@ const (
 )
 
 const (
-	ReasonBelowActionThreshold        = "BELOW_ACTION_THRESHOLD"
-	ReasonInsufficientEvidence        = "INSUFFICIENT_CONFIDENCE_OR_COVERAGE"
-	ReasonNoActionableTarget          = "NO_ACTIONABLE_TARGET"
-	ReasonProtectedMember             = "PROTECTED_MEMBER"
-	ReasonUnverifiedSender            = "SENDER_IDENTITY_UNVERIFIED"
-	ReasonAutomaticActionsDisabled    = "AUTOMATIC_ACTIONS_DISABLED"
-	ReasonAutobanDisabled             = "AUTOBAN_DISABLED"
-	ReasonCertainAdvertising          = "CERTAIN_ADVERTISING"
-	ReasonLikelyAdvertising           = "LIKELY_ADVERTISING"
-	ReasonMessageEvidenceRequired     = "CURRENT_MESSAGE_EVIDENCE_REQUIRED"
-	ReasonProfileChannelAdvertising   = "PROFILE_CHANNEL_ADVERTISING"
-	ReasonConfirmedAdvertisingChannel = detection.ReasonConfirmedAdvertisingChannel
-	DecisionPolicyVersion             = "message-evidence-v6"
+	ReasonBelowActionThreshold             = "BELOW_ACTION_THRESHOLD"
+	ReasonInsufficientEvidence             = "INSUFFICIENT_CONFIDENCE_OR_COVERAGE"
+	ReasonNoActionableTarget               = "NO_ACTIONABLE_TARGET"
+	ReasonProtectedMember                  = "PROTECTED_MEMBER"
+	ReasonUnverifiedSender                 = "SENDER_IDENTITY_UNVERIFIED"
+	ReasonAutomaticActionsDisabled         = "AUTOMATIC_ACTIONS_DISABLED"
+	ReasonAutobanDisabled                  = "AUTOBAN_DISABLED"
+	ReasonCertainAdvertising               = "CERTAIN_ADVERTISING"
+	ReasonLikelyAdvertising                = "LIKELY_ADVERTISING"
+	ReasonMessageEvidenceRequired          = "CURRENT_MESSAGE_EVIDENCE_REQUIRED"
+	ReasonProfileChannelAdvertising        = "PROFILE_CHANNEL_ADVERTISING"
+	ReasonConfirmedAdvertisingChannel      = detection.ReasonConfirmedAdvertisingChannel
+	ReasonConfirmedProfileAdvertising      = detection.ReasonConfirmedProfileAdvertising
+	ReasonConfirmedAdultAdvertisingChannel = detection.ReasonConfirmedAdultAdvertisingChannel
+	ReasonConfirmedAdultChannel            = detection.ReasonConfirmedAdultChannel
+	ReasonConfirmedFraudChannel            = detection.ReasonConfirmedFraudChannel
+	DecisionPolicyVersion                  = "message-evidence-v12"
 )
 
 // ActionTarget contains stable Telegram identifiers needed by an action worker.
@@ -102,8 +107,8 @@ type Decision struct {
 }
 
 // DecisionEngine applies conservative, deterministic action thresholds.
-// Automatic enforcement is message-only and delete-only. Manual moderator
-// commands retain their separate authorization path.
+// Automatic enforcement deletes advertising messages and permits banning only
+// for confirmed adult advertising channels. Manual commands have a separate path.
 type DecisionEngine struct{}
 
 func NewDecisionEngine() *DecisionEngine { return &DecisionEngine{} }
@@ -116,6 +121,7 @@ func (e *DecisionEngine) Decide(input DecisionInput) Decision {
 	}
 	hasMessageEvidence := false
 	hasAdvertisingChannelEvidence := false
+	var messageEvidence, channelEvidence, banEvidence *detection.Signal
 	for _, signal := range input.Signals {
 		if signal.Status != detection.StatusAvailable || signal.Score == nil ||
 			signal.Confidence == nil {
@@ -134,14 +140,44 @@ func (e *DecisionEngine) Decide(input DecisionInput) Decision {
 			decision.DecisionConfidence = *signal.Confidence
 			decision.EvidenceCoverage = signal.EvidenceCoverage
 		}
-		if (strings.HasPrefix(signal.Detector, "message.") || signal.Detector == "model.jev_advertising") &&
+		if (strings.HasPrefix(signal.Detector, "message.") || signal.Detector == "model.jev_advertising" || signal.Detector == detection.SemanticMessageDetector) &&
 			*signal.Score >= .90 && *signal.Confidence >= .90 && signal.EvidenceCoverage >= .50 {
 			hasMessageEvidence = true
+			messageEvidence = preferEvidence(messageEvidence, signal)
 		}
-		if signal.Detector == detection.AdvertisingChannelDetectorName &&
+		if (signal.Detector == detection.AdvertisingChannelDetectorName || signal.Detector == detection.SemanticProfileDetector) &&
 			*signal.Score >= .90 && *signal.Confidence >= .90 && signal.EvidenceCoverage >= .50 &&
 			strings.TrimSpace(signal.EvidenceExcerpt) != "" {
 			hasAdvertisingChannelEvidence = true
+			channelEvidence = preferEvidence(channelEvidence, signal)
+			if signal.Detector == detection.AdvertisingChannelDetectorName && *signal.Score >= .98 && *signal.Confidence >= .98 && signal.EvidenceCoverage == 1 &&
+				slices.Contains(signal.ReasonCodes, detection.ReasonConfirmedAdultAdvertisingChannel) {
+				banEvidence = preferEvidence(banEvidence, signal)
+			}
+		}
+		if signal.Detector == detection.ProhibitedChannelDetectorName &&
+			*signal.Score >= .98 && *signal.Confidence >= .98 && signal.EvidenceCoverage == 1 &&
+			strings.TrimSpace(signal.EvidenceExcerpt) != "" &&
+			(slices.Contains(signal.ReasonCodes, detection.ReasonConfirmedAdultChannel) ||
+				slices.Contains(signal.ReasonCodes, detection.ReasonConfirmedFraudChannel)) {
+			banEvidence = preferEvidence(banEvidence, signal)
+		}
+	}
+	// Confidence and coverage must come from evidence that can authorize this
+	// action. An unrelated profile signal must not suppress a confirmed offer.
+	if input.Target.Kind == TargetMessage {
+		var evidence *detection.Signal
+		switch {
+		case input.AllowAdvertisingChannelDeletion && banEvidence != nil && input.Target.UserID > 0:
+			evidence = banEvidence
+		case input.HasMessageContent && messageEvidence != nil:
+			evidence = messageEvidence
+		case input.AllowAdvertisingChannelDeletion && channelEvidence != nil:
+			evidence = channelEvidence
+		}
+		if evidence != nil {
+			decision.DecisionConfidence = *evidence.Confidence
+			decision.EvidenceCoverage = evidence.EvidenceCoverage
 		}
 	}
 
@@ -172,11 +208,31 @@ func (e *DecisionEngine) Decide(input DecisionInput) Decision {
 		decision.AuthorizationReason = ReasonUnverifiedSender
 		return decision
 	}
+	if input.Target.Kind == TargetMessage && input.Target.UserID > 0 &&
+		input.AllowAdvertisingChannelDeletion && banEvidence != nil {
+		decision.RecommendedAction = ActionBanUser
+		decision.AuthorizedAction = ActionBanUser
+		decision.AuthorizationReason = ReasonConfirmedAdultAdvertisingChannel
+		if banEvidence.Detector == detection.ProhibitedChannelDetectorName {
+			decision.AuthorizationReason = ReasonConfirmedAdultChannel
+			if slices.Contains(banEvidence.ReasonCodes, detection.ReasonConfirmedFraudChannel) {
+				decision.AuthorizationReason = ReasonConfirmedFraudChannel
+			}
+		}
+		if input.AutobanDisabled {
+			decision.AuthorizedAction = ActionDeleteMessage
+			decision.AuthorizationReason = ReasonAutobanDisabled
+		}
+		return decision
+	}
 	if input.Target.Kind == TargetMessage && input.AllowAdvertisingChannelDeletion &&
 		hasAdvertisingChannelEvidence && (!input.HasMessageContent || !hasMessageEvidence) {
 		decision.RecommendedAction = ActionDeleteMessage
 		decision.AuthorizedAction = ActionDeleteMessage
 		decision.AuthorizationReason = ReasonConfirmedAdvertisingChannel
+		if channelEvidence.Detector == detection.SemanticProfileDetector {
+			decision.AuthorizationReason = ReasonConfirmedProfileAdvertising
+		}
 		return decision
 	}
 	if input.Target.Kind != TargetMessage || !input.HasMessageContent || !hasMessageEvidence {
@@ -192,6 +248,15 @@ func (e *DecisionEngine) Decide(input DecisionInput) Decision {
 		decision.AuthorizationReason = ReasonNoActionableTarget
 	}
 	return decision
+}
+
+func preferEvidence(current *detection.Signal, candidate detection.Signal) *detection.Signal {
+	if current == nil || *candidate.Confidence > *current.Confidence ||
+		(*candidate.Confidence == *current.Confidence && candidate.EvidenceCoverage > current.EvidenceCoverage) ||
+		(*candidate.Confidence == *current.Confidence && candidate.EvidenceCoverage == current.EvidenceCoverage && *candidate.Score > *current.Score) {
+		return &candidate
+	}
+	return current
 }
 
 func recommendedAction(score float64, kind TargetKind) ActionType {

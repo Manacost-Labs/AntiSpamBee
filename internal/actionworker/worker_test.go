@@ -26,6 +26,38 @@ type repositoryStub struct {
 	notificationStatus string
 	notificationNext   time.Time
 	completionErr      error
+	policy             *moderation.CommunityPolicy
+	policyErr          error
+	policyCalls        int
+	commandReply       moderation.ClaimedCommandReply
+	commandReplyFound  bool
+	commandReplyStatus string
+	commandReplyNext   time.Time
+	commandReplyError  string
+}
+
+func (r *repositoryStub) ClaimCommandReply(context.Context, string, time.Duration) (moderation.ClaimedCommandReply, bool, error) {
+	return r.commandReply, r.commandReplyFound, nil
+}
+
+func (r *repositoryStub) FinishCommandReply(_ context.Context, _ moderation.ClaimedCommandReply, status string, next time.Time, message string) error {
+	if r.completionErr != nil {
+		return r.completionErr
+	}
+	r.commandReplyStatus, r.commandReplyNext, r.commandReplyError = status, next, message
+	r.commandReplyFound = status == "RETRYABLE"
+	return nil
+}
+
+func (r *repositoryStub) GetCommunityPolicy(_ context.Context, tenantID string, chatID, userID int64) (moderation.CommunityPolicy, error) {
+	r.policyCalls++
+	if tenantID != r.action.TenantID || chatID != r.action.Target.ChatID || userID != r.action.Target.UserID {
+		return moderation.CommunityPolicy{}, errors.New("incorrect policy lookup identity")
+	}
+	if r.policy != nil {
+		return *r.policy, r.policyErr
+	}
+	return moderation.CommunityPolicy{ProtectionLevel: "STRICT", AutomaticActionsEnabled: true, AutobanEnabled: true}, r.policyErr
 }
 
 func (r *repositoryStub) ClaimAction(context.Context, string, time.Duration) (moderation.ClaimedAction, bool, error) {
@@ -77,6 +109,8 @@ type telegramStub struct {
 	memberStatus      string
 	memberStatuses    map[int64]string
 	memberStatusErr   error
+	memberChecks      int
+	onMemberCheck     func()
 	bans              int
 	messageDeletes    int
 	reactionDeletes   int
@@ -100,6 +134,10 @@ func (t *telegramStub) DeleteMessageReaction(context.Context, int64, int64, int6
 	return t.deleteReactionErr
 }
 func (t *telegramStub) GetChatMemberStatus(_ context.Context, _ int64, userID int64) (string, error) {
+	t.memberChecks++
+	if t.onMemberCheck != nil {
+		t.onMemberCheck()
+	}
 	if status, ok := t.memberStatuses[userID]; ok {
 		return status, t.memberStatusErr
 	}
@@ -223,6 +261,51 @@ func TestWorkerCancelsDeletionWithoutRealAuthor(t *testing.T) {
 	}
 }
 
+func TestWorkerRechecksAdministratorBeforeFirstBanAttempt(t *testing.T) {
+	for _, tc := range []struct {
+		name, status                   string
+		statusErr                      error
+		wantBan, wantCancel, wantRetry bool
+	}{
+		{"ordinary member", "member", nil, true, false, false},
+		{"promoted administrator", "administrator", nil, false, true, false},
+		{"owner", "creator", nil, false, true, false},
+		{"status unavailable", "", errors.New("Telegram unavailable"), false, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			action := claimedAction(moderation.ActionBanUser, 1)
+			action.AuthorizationReason = moderation.ReasonConfirmedAdultAdvertisingChannel
+			repo := &repositoryStub{found: true, action: action}
+			tg := &telegramStub{memberStatus: tc.status, memberStatusErr: tc.statusErr}
+			worked, err := newTestWorker(t, repo, tg).RunOnce(context.Background())
+			if !worked || err != nil {
+				t.Fatalf("RunOnce() = %v, %v", worked, err)
+			}
+			if tg.memberChecks != 1 || (tg.bans > 0) != tc.wantBan || (repo.cancelledErr != "") != tc.wantCancel || (repo.retryError != "") != tc.wantRetry {
+				t.Fatalf("checks=%d bans=%d cancelled=%q retry=%q", tg.memberChecks, tg.bans, repo.cancelledErr, repo.retryError)
+			}
+			if !tc.wantBan && (repo.succeeded || len(tg.messages) != 0) {
+				t.Fatal("unexecuted ban cannot be reported as successful")
+			}
+		})
+	}
+}
+
+func TestWorkerCancelsBanWithoutRealMember(t *testing.T) {
+	for _, userID := range []int64{0, 777000, 1087968824} {
+		action := claimedAction(moderation.ActionBanUser, 1)
+		action.Target.UserID = userID
+		repo := &repositoryStub{found: true, action: action}
+		tg := &telegramStub{}
+		if worked, err := newTestWorker(t, repo, tg).RunOnce(context.Background()); !worked || err != nil {
+			t.Fatalf("RunOnce() = %v, %v", worked, err)
+		}
+		if tg.bans != 0 || tg.memberChecks != 0 || repo.cancelledErr == "" {
+			t.Fatalf("user %d: bans=%d checks=%d cancelled=%q", userID, tg.bans, tg.memberChecks, repo.cancelledErr)
+		}
+	}
+}
+
 func TestWorkerDoesNotNotifyAdminWhenMessageDeletionFails(t *testing.T) {
 	action := claimedAction(moderation.ActionDeleteMessage, 1)
 	action.Notification = moderation.DeletionNotification{ChatID: 9001, Message: "Спам"}
@@ -236,6 +319,26 @@ func TestWorkerDoesNotNotifyAdminWhenMessageDeletionFails(t *testing.T) {
 	}
 	if len(telegram.messages) != 0 {
 		t.Fatalf("notifications = %q", telegram.messages)
+	}
+}
+
+func TestWorkerTreatsAlreadyDeletedMessageAsAssumedSuccess(t *testing.T) {
+	repo := &repositoryStub{found: true, action: claimedAction(moderation.ActionDeleteMessage, 1)}
+	telegram := &telegramStub{deleteMessageErr: &telegramapi.APIError{ErrorCode: 400, Description: "Bad Request: message to delete not found"}}
+	worker := newTestWorker(t, repo, telegram)
+	if worked, err := worker.RunOnce(context.Background()); err != nil || !worked || !repo.succeeded || !repo.assumed {
+		t.Fatalf("delete recovery = %t/%v, successful/assumed = %t/%t", worked, err, repo.succeeded, repo.assumed)
+	}
+}
+
+func TestWorkerExecutesScopedAdvertisingBanWithoutPostingInGroup(t *testing.T) {
+	action := claimedAction(moderation.ActionBanUser, 1)
+	action.AuthorizationReason = moderation.ReasonConfirmedAdvertisingAutoban
+	repo := &repositoryStub{found: true, action: action}
+	telegram := &telegramStub{}
+	worker := newTestWorker(t, repo, telegram)
+	if worked, err := worker.RunOnce(context.Background()); err != nil || !worked || telegram.bans != 1 || !repo.succeeded || len(telegram.messages) != 0 {
+		t.Fatalf("ban = %t/%v, bans=%d, successful=%t, messages=%d", worked, err, telegram.bans, repo.succeeded, len(telegram.messages))
 	}
 }
 

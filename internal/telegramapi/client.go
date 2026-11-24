@@ -123,8 +123,9 @@ func (c *Client) FetchProfile(ctx context.Context, userID int64) (detection.Prof
 	}
 
 	posts := make([]string, 0, len(messages))
+	var postImages []string
 	for _, message := range messages {
-		if message.ChannelChatCreated {
+		if message.isChannelService() {
 			continue
 		}
 		text := message.Text
@@ -134,12 +135,19 @@ func (c *Client) FetchProfile(ctx context.Context, userID int64) (detection.Prof
 		// Keep media-only posts: omitting them could make a personal music/photo
 		// channel with one sponsored post look like an advertising-only channel.
 		posts = append(posts, text)
+		if imageID := message.BestImageFileID(detection.MaxProfileImageBytes); imageID != "" {
+			for len(postImages) < len(posts)-1 {
+				postImages = append(postImages, "")
+			}
+			postImages = append(postImages, imageID)
+		}
 	}
 	profile.PersonalChannel = &detection.PersonalChannel{
-		Title:       firstNonEmpty(channel.Title, userChat.PersonalChat.Title),
-		Username:    firstNonEmpty(channel.Username, userChat.PersonalChat.Username),
-		Description: channel.Description,
-		RecentPosts: posts,
+		Title:              firstNonEmpty(channel.Title, userChat.PersonalChat.Title),
+		Username:           firstNonEmpty(channel.Username, userChat.PersonalChat.Username),
+		Description:        channel.Description,
+		RecentPosts:        posts,
+		RecentPostImageIDs: postImages,
 	}
 	return profile, nil
 }
@@ -178,11 +186,11 @@ func (c *Client) DownloadFile(ctx context.Context, fileID string, maxBytes int64
 		nil,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("create Telegram file request: %w", err)
+		return nil, fmt.Errorf("create Telegram file request: %w", c.redactRequestError(err))
 	}
 	response, err := c.httpClient.Do(request)
 	if err != nil {
-		return nil, fmt.Errorf("download Telegram file: %w", err)
+		return nil, fmt.Errorf("download Telegram file: %w", c.redactRequestError(err))
 	}
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
@@ -530,13 +538,13 @@ func (c *Client) call(ctx context.Context, method string, payload, result any) e
 		bytes.NewReader(body),
 	)
 	if err != nil {
-		return fmt.Errorf("create request: %w", err)
+		return fmt.Errorf("create request: %w", c.redactRequestError(err))
 	}
 	request.Header.Set("Content-Type", "application/json")
 
 	response, err := c.httpClient.Do(request)
 	if err != nil {
-		return fmt.Errorf("send request: %w", err)
+		return fmt.Errorf("send request: %w", c.redactRequestError(err))
 	}
 	defer response.Body.Close()
 
@@ -565,6 +573,20 @@ func (c *Client) call(ctx context.Context, method string, payload, result any) e
 	return nil
 }
 
+// Preserve the error chain for retry classification, while preventing the
+// token embedded in Telegram request URLs from reaching logs or stored errors.
+func (c *Client) redactRequestError(err error) error {
+	return &redactedRequestError{cause: err, text: strings.ReplaceAll(err.Error(), c.token, "[REDACTED]")}
+}
+
+type redactedRequestError struct {
+	cause error
+	text  string
+}
+
+func (e *redactedRequestError) Error() string { return e.text }
+func (e *redactedRequestError) Unwrap() error { return e.cause }
+
 type chat struct {
 	ID       int64  `json:"id"`
 	Title    string `json:"title"`
@@ -579,10 +601,25 @@ type chatFullInfo struct {
 }
 
 type message struct {
-	MessageID          int64  `json:"message_id"`
-	Text               string `json:"text"`
-	Caption            string `json:"caption"`
-	ChannelChatCreated bool   `json:"channel_chat_created"`
+	ImageAttachment
+	MessageID          int64             `json:"message_id"`
+	Text               string            `json:"text"`
+	Caption            string            `json:"caption"`
+	ChannelChatCreated bool              `json:"channel_chat_created"`
+	NewChatTitle       string            `json:"new_chat_title"`
+	NewChatPhoto       []json.RawMessage `json:"new_chat_photo"`
+	DeleteChatPhoto    bool              `json:"delete_chat_photo"`
+	PinnedMessage      *json.RawMessage  `json:"pinned_message"`
+	AutoDeleteChanged  *json.RawMessage  `json:"message_auto_delete_timer_changed"`
+}
+
+func (m message) isChannelService() bool {
+	// These are administrative events, not channel publications. Actual media
+	// without a caption must remain in the sample as unknown content.
+	// https://core.telegram.org/bots/api#message
+	return m.Text == "" && m.Caption == "" && (m.ChannelChatCreated ||
+		m.NewChatTitle != "" || len(m.NewChatPhoto) > 0 || m.DeleteChatPhoto ||
+		m.PinnedMessage != nil || m.AutoDeleteChanged != nil)
 }
 
 func firstNonEmpty(values ...string) string {

@@ -203,6 +203,125 @@ func TestProcessorEnforcesConfirmedAdvertisingChannelWithAdminProtection(t *test
 	}
 }
 
+func TestProcessorEnforcesAdultChannelPromotionWithPolicyAndAdministratorProtection(t *testing.T) {
+	for _, tc := range []struct {
+		name, level, status                                string
+		actionsEnabled, autobanEnabled, allowlisted, media bool
+		memberErr                                          error
+		wantDelete, wantBan                                bool
+	}{
+		{"ordinary member", "STRICT", "member", true, true, false, false, nil, true, true},
+		{"media message", "STRICT", "member", true, true, false, true, nil, true, true},
+		{"administrator", "STRICT", "administrator", true, true, false, false, nil, false, false},
+		{"owner", "STRICT", "creator", true, true, false, false, nil, false, false},
+		{"allowlisted", "STRICT", "member", true, true, true, false, nil, false, false},
+		{"standard", "STANDARD", "member", true, true, false, false, nil, false, false},
+		{"observe", "OBSERVE", "member", true, true, false, false, nil, false, false},
+		{"actions disabled", "STRICT", "member", false, true, false, false, nil, false, false},
+		{"autoban disabled", "STRICT", "member", true, false, false, false, nil, true, false},
+		{"member status unavailable", "STRICT", "", true, true, false, false, errors.New("Telegram unavailable"), false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &recordingStore{}
+			fetcher := &profileFetcherStub{
+				profile:      detection.Profile{PersonalChannel: &detection.PersonalChannel{Title: "✨ Закрытый коллекция 18+", RecentPosts: []string{"😘 Горячие ролики. Доступ по заявке в канал 👉 https://t.me/+exampleInvite"}}},
+				memberStatus: tc.status, memberErr: tc.memberErr,
+			}
+			policy := CommunityPolicy{ProtectionLevel: tc.level, AutomaticActionsEnabled: tc.actionsEnabled, AutobanEnabled: tc.autobanEnabled, IsAllowlisted: tc.allowlisted}
+			processor, err := NewProcessor(store, fetcher, detection.NewProfileDetector(), WithPolicyStore(&communityPolicyStub{policy: policy}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			payload := `{"message":{"message_id":7,"from":{"id":42},"chat":{"id":-1001,"type":"supergroup"},"text":"Привет всем"}}`
+			if tc.media {
+				payload = `{"message":{"message_id":7,"from":{"id":42},"chat":{"id":-1001,"type":"supergroup"},"photo":[{"file_id":"photo-id"}]}}`
+			}
+			err = processor.Process(context.Background(), telegramEvent(payload))
+			if tc.memberErr != nil {
+				if err == nil || store.event.EventID != "" {
+					t.Fatalf("member status error must retry without recording actions: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if hasAction(store.outcome, ActionDeleteMessage) != tc.wantDelete || hasAction(store.outcome, ActionBanUser) != tc.wantBan {
+				t.Fatalf("unexpected outcome: %+v", store.outcome)
+			}
+			if tc.wantBan && (len(store.outcome.Actions) != 2 || store.outcome.Actions[0].Type != ActionDeleteMessage || store.outcome.Actions[1].Type != ActionBanUser) {
+				t.Fatalf("must delete before banning: %+v", store.outcome.Actions)
+			}
+		})
+	}
+}
+
+func TestProcessorActsOnlyInEnforcementModes(t *testing.T) {
+	for _, level := range []string{"SOFT", "OBSERVE", "UNKNOWN", "STANDARD", "STRICT"} {
+		t.Run(level, func(t *testing.T) {
+			store := &recordingStore{}
+			policy := CommunityPolicy{ProtectionLevel: level, AutomaticActionsEnabled: true, AutobanEnabled: true}
+			processor, err := NewProcessor(store, &profileFetcherStub{}, detection.NewProfileDetector(), WithPolicyStore(&communityPolicyStub{policy: policy}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			event := telegramEvent(`{"message":{"message_id":7,"from":{"id":42},"chat":{"id":-1001,"type":"supergroup"},"text":"Казино: бонус за первый депозит. Регистрируйся https://example.com"}}`)
+			if err := processor.Process(context.Background(), event); err != nil {
+				t.Fatal(err)
+			}
+			wantDelete := level == "STANDARD" || level == "STRICT"
+			if hasAction(store.outcome, ActionDeleteMessage) != wantDelete {
+				t.Fatalf("level %s: %+v", level, store.outcome)
+			}
+			if !wantDelete && store.outcome.Decision.AuthorizationReason != ReasonAutomaticActionsDisabled {
+				t.Fatalf("level %s: %+v", level, store.outcome.Decision)
+			}
+		})
+	}
+}
+
+type activityObserverStub struct{ calls int }
+
+func (s *activityObserverStub) ObserveMessage(_ context.Context, _ events.TelegramUpdate, target ActionTarget, _ detection.MessageContent) (detection.BehaviorStats, error) {
+	s.calls++
+	if target.UserID <= 0 {
+		return detection.BehaviorStats{}, errors.New("message author is unavailable")
+	}
+	return detection.BehaviorStats{}, nil
+}
+
+func TestProcessorObservesBehaviorOnlyForIdentifiedUsers(t *testing.T) {
+	for _, sender := range []struct {
+		name, extra string
+		wantCalls   int
+	}{
+		{"ordinary user", "", 1},
+		{"anonymous administrator", `,"sender_chat":{"id":-1001}`, 0},
+		{"linked channel forward", `,"sender_chat":{"id":-1002},"is_automatic_forward":true`, 0},
+		{"other sender channel", `,"sender_chat":{"id":-1002}`, 0},
+	} {
+		t.Run(sender.name, func(t *testing.T) {
+			store, activity := &recordingStore{}, &activityObserverStub{}
+			processor, err := NewProcessor(store, &profileFetcherStub{}, detection.NewProfileDetector(), WithBehaviorStore(activity))
+			if err != nil {
+				t.Fatal(err)
+			}
+			payload := fmt.Sprintf(`{"message":{"message_id":7,"from":{"id":42},"chat":{"id":-1001,"type":"supergroup"},"text":"Привет всем"%s}}`, sender.extra)
+			if err := processor.Process(context.Background(), telegramEvent(payload)); err != nil {
+				t.Fatal(err)
+			}
+			if activity.calls != sender.wantCalls {
+				t.Fatalf("activity calls = %d, want %d", activity.calls, sender.wantCalls)
+			}
+			for _, signal := range store.outcome.Signals {
+				if signal.Detector == "behavior.spam" && signal.Status == detection.StatusError {
+					t.Fatal("anonymous posts must not create behavior errors")
+				}
+			}
+		})
+	}
+}
+
 func TestProcessorProtectsAdministratorMessageOrigins(t *testing.T) {
 	for _, tc := range []struct {
 		name            string

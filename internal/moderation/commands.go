@@ -18,11 +18,7 @@ const ReasonModeratorCommand = "MODERATOR_COMMAND"
 type commandStore interface {
 	terminalRecorder
 	RecordUserReport(context.Context, string, int64, int64, int64, int64) error
-	SetCommunityProtection(context.Context, string, int64, string) error
-	SetCommunityModerator(context.Context, string, int64, int64) error
-	SetCommunityModeratorSenderChat(context.Context, string, int64, int64, int64) error
 	IsAuthorizedSenderChat(context.Context, string, int64, int64) (bool, error)
-	SetAllowlisted(context.Context, string, int64, int64, int64, bool) error
 	GetCommunityPolicy(context.Context, string, int64, int64) (CommunityPolicy, error)
 	ListCommunityPoliciesForModerator(context.Context, string, int64) ([]CommunityPolicy, error)
 	ListModerationHistory(context.Context, string, int64) ([]HistoryEntry, error)
@@ -71,8 +67,11 @@ func NewCommandRouter(
 }
 
 func (r *CommandRouter) Process(ctx context.Context, event events.TelegramUpdate) error {
+	if handled, err := r.processReviewCallback(ctx, event); handled {
+		return err
+	}
 	if chatID, adminID, ok := botAddedToCommunity(event.Payload); ok {
-		return r.store.SetCommunityModerator(ctx, event.TenantID, chatID, adminID)
+		return r.recordCommand(ctx, event, nil, CommandCommit{Mutation: CommandMutation{ChatID: chatID, ModeratorUserID: adminID}})
 	}
 	command, ok := parseCommand(event.Payload)
 	if !ok {
@@ -123,8 +122,8 @@ func (r *CommandRouter) Process(ctx context.Context, event events.TelegramUpdate
 			return err
 		}
 		return r.telegram.SendMessage(ctx, command.ChatID, fmt.Sprintf(
-			"AntiSpamBee: уровень %s, автоматические действия: %t. Автобан приостановлен до подтверждения нарушений.",
-			policy.ProtectionLevel, policy.AutomaticActionsEnabled,
+			"AntiSpamBee: уровень %s, автоматические действия: %t, автобан: %t.",
+			policy.ProtectionLevel, policy.AutomaticActionsEnabled, policy.AutobanEnabled,
 		))
 	case "link":
 		return r.handleLink(ctx, event, command)
@@ -159,17 +158,14 @@ func (r *CommandRouter) handleLink(ctx context.Context, event events.TelegramUpd
 		if status != "administrator" && status != "creator" {
 			return r.respondToInvalidCommand(ctx, event, command.ChatID, "Ваш личный аккаунт должен быть администратором этой группы.")
 		}
-		if err := r.store.SetCommunityModeratorSenderChat(ctx, event.TenantID, chatID, command.SenderID, senderChatID); err != nil {
-			return err
-		}
-		if err := r.recordCommand(ctx, event, nil); err != nil {
-			return err
-		}
 		title, err := r.telegram.GetChatTitle(ctx, chatID)
 		if err != nil || strings.TrimSpace(title) == "" {
 			title = fmt.Sprintf("Группа %d", chatID)
 		}
-		return r.telegram.SendMessage(ctx, command.ChatID, "Группа привязана: "+title)
+		return r.recordCommand(ctx, event, nil, CommandCommit{
+			Mutation: CommandMutation{ChatID: chatID, ModeratorUserID: command.SenderID, SenderChatID: senderChatID},
+			Replies:  []CommandReply{{ChatID: command.ChatID, Text: "Группа привязана: " + title}},
+		})
 	}
 	if (command.ChatType != "group" && command.ChatType != "supergroup") || !command.SentAsChat {
 		return r.respondToInvalidCommand(ctx, event, command.ChatID, "Эту команду отправьте от имени группы.")
@@ -204,8 +200,8 @@ func (r *CommandRouter) handlePersonalStatus(ctx context.Context, event events.T
 			title = fmt.Sprintf("Группа %d", policy.ChatID)
 		}
 		lines = append(lines, fmt.Sprintf(
-			"%s: уровень %s, автоматические действия: %t. Автобан приостановлен до подтверждения нарушений.\nЖурнал: /history %d",
-			title, policy.ProtectionLevel, policy.AutomaticActionsEnabled, policy.ChatID,
+			"%s: уровень %s, автоматические действия: %t, автобан: %t.\nЖурнал: /history %d",
+			title, policy.ProtectionLevel, policy.AutomaticActionsEnabled, policy.AutobanEnabled, policy.ChatID,
 		))
 	}
 	return r.telegram.SendMessage(ctx, command.ChatID, strings.Join(lines, "\n"))
@@ -334,18 +330,14 @@ func (r *CommandRouter) handleProtection(ctx context.Context, event events.Teleg
 	if !valid[command.Argument] {
 		return r.respondToInvalidCommand(ctx, event, command.ChatID, "Использование: /protection observe|soft|standard|strict")
 	}
-	if err := r.store.SetCommunityProtection(ctx, event.TenantID, command.ChatID, command.Argument); err != nil {
-		return err
-	}
+	mutation := CommandMutation{ChatID: command.ChatID, ProtectionLevel: command.Argument}
 	if command.SenderID > 0 && command.SenderChatID == 0 {
-		if err := r.store.SetCommunityModerator(ctx, event.TenantID, command.ChatID, command.SenderID); err != nil {
-			return err
-		}
+		mutation.ModeratorUserID = command.SenderID
 	}
-	if err := r.recordCommand(ctx, event, nil); err != nil {
-		return err
-	}
-	return r.telegram.SendMessage(ctx, command.ChatID, "Уровень защиты установлен: "+command.Argument)
+	return r.recordCommand(ctx, event, nil, CommandCommit{
+		Mutation: mutation,
+		Replies:  []CommandReply{{ChatID: command.ChatID, Text: "Уровень защиты установлен: " + command.Argument}},
+	})
 }
 
 func (r *CommandRouter) handleAllowlist(ctx context.Context, event events.TelegramUpdate, command parsedCommand, allowed bool) error {
@@ -357,13 +349,14 @@ func (r *CommandRouter) handleAllowlist(ctx context.Context, event events.Telegr
 	if command.ReplyUserID <= 0 {
 		return r.respondToInvalidCommand(ctx, event, command.ChatID, "Ответьте этой командой на сообщение пользователя.")
 	}
-	if err := r.store.SetAllowlisted(ctx, event.TenantID, command.ChatID, command.ReplyUserID, command.SenderID, allowed); err != nil {
-		return err
+	addedBy := command.SenderID
+	if command.SenderChatID != 0 {
+		addedBy = command.SenderChatID
 	}
-	if err := r.recordCommand(ctx, event, nil); err != nil {
-		return err
-	}
-	return r.telegram.SendMessage(ctx, command.ChatID, "Allowlist обновлён.")
+	return r.recordCommand(ctx, event, nil, CommandCommit{
+		Mutation: CommandMutation{ChatID: command.ChatID, Allowlist: &AllowlistChange{UserID: command.ReplyUserID, AddedBy: addedBy, Allowed: allowed}},
+		Replies:  []CommandReply{{ChatID: command.ChatID, Text: "Allowlist обновлён."}},
+	})
 }
 
 func (r *CommandRouter) handleModeratorAction(ctx context.Context, event events.TelegramUpdate, command parsedCommand) error {
@@ -392,10 +385,7 @@ func (r *CommandRouter) handleModeratorAction(ctx context.Context, event events.
 		return r.respondToInvalidCommand(ctx, event, command.ChatID, "Нельзя применить действие к администратору или владельцу.")
 	}
 	if command.Name == "warn" {
-		if err := r.recordCommand(ctx, event, nil); err != nil {
-			return err
-		}
-		return r.telegram.SendMessage(ctx, command.ChatID, fmt.Sprintf("Предупреждение пользователю %d от модератора.", targetUserID))
+		return r.recordCommand(ctx, event, nil, CommandCommit{Replies: []CommandReply{{ChatID: command.ChatID, Text: fmt.Sprintf("Предупреждение пользователю %d от модератора.", targetUserID)}}})
 	}
 	actionType := ActionBanUser
 	untilDate := int64(0)
@@ -414,10 +404,7 @@ func (r *CommandRouter) handleModeratorAction(ctx context.Context, event events.
 		Type: actionType, Target: target, UntilDate: untilDate,
 		IdempotencyKey: actionIdempotencyKey(event.EventID, actionType, target),
 	}
-	if err := r.recordCommand(ctx, event, action); err != nil {
-		return err
-	}
-	return r.telegram.SendMessage(ctx, command.ChatID, "Действие поставлено в безопасную очередь.")
+	return r.recordCommand(ctx, event, action, CommandCommit{Replies: []CommandReply{{ChatID: command.ChatID, Text: "Действие поставлено в безопасную очередь."}}})
 }
 
 func (r *CommandRouter) requireAdmin(ctx context.Context, tenantID string, command parsedCommand) (bool, error) {
@@ -444,7 +431,7 @@ func (r *CommandRouter) respondToInvalidCommand(ctx context.Context, event event
 	return r.telegram.SendMessage(ctx, chatID, message)
 }
 
-func (r *CommandRouter) recordCommand(ctx context.Context, event events.TelegramUpdate, action *ActionRequest) error {
+func (r *CommandRouter) recordCommand(ctx context.Context, event events.TelegramUpdate, action *ActionRequest, commits ...CommandCommit) error {
 	score, confidence := 0.0, 1.0
 	signal := detection.Signal{
 		SchemaVersion: "1", Detector: "system.command", DetectorVersion: "command-v1",
@@ -487,9 +474,13 @@ func (r *CommandRouter) recordCommand(ctx context.Context, event events.Telegram
 		evidence = newEvidence(action.Target, messageContent(reply), detection.Profile{}, []detection.Signal{signal}, decision, CommunityPolicy{}, false)
 		evidence.AuthorUsername = messageAuthorUsername(reply)
 	}
-	return r.store.RecordTerminal(ctx, event, Outcome{
+	outcome := Outcome{
 		State: state, Signals: []detection.Signal{signal}, Decision: decision, Actions: actions, Evidence: evidence,
-	})
+	}
+	if len(commits) > 0 {
+		outcome.Command = &commits[0]
+	}
+	return r.store.RecordTerminal(ctx, event, outcome)
 }
 
 func commandHelp() string {
@@ -506,7 +497,7 @@ func commandHelp() string {
 /protection observe — только наблюдение
 /protection soft — ручная модерация
 /protection standard — удаление рекламы без автобана
-/protection strict — удаление явной рекламы; автобан пока приостановлен
+/protection strict — удаление рекламы; автобан за подтверждённый запрещённый канал в профиле
 /allow и /unallow — добавить или убрать автора из исключений
 /warn — предупредить автора
 /mute — ограничить автора на 1 час

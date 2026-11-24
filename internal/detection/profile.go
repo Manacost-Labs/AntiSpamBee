@@ -57,10 +57,11 @@ type Profile struct {
 
 // PersonalChannel contains the small profile-channel sample used by the rule.
 type PersonalChannel struct {
-	Title       string
-	Username    string
-	Description string
-	RecentPosts []string
+	Title              string
+	Username           string
+	Description        string
+	RecentPosts        []string
+	RecentPostImageIDs []string `json:"-"`
 }
 
 // ProfileDetector detects advertising hidden in a user's personal channel.

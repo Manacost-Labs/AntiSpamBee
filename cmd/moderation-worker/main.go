@@ -46,15 +46,33 @@ func run(ctx context.Context, config config) error {
 	if err != nil {
 		return err
 	}
-	var semantic *openrouter.Client
+	var semanticOptions []moderation.ProcessorOption
 	if config.OpenRouterAPIKey != "" {
-		semantic, err = openrouter.NewClient(openrouter.ClientConfig{
+		clientConfig := openrouter.ClientConfig{
 			APIKey:  config.OpenRouterAPIKey,
 			BaseURL: config.OpenRouterBaseURL,
 			Model:   config.OpenRouterModel,
-		})
+		}
+		semantic, err := openrouter.NewClient(clientConfig)
 		if err != nil {
 			return err
+		}
+		semanticOptions = append(semanticOptions, moderation.WithSemanticAnalyzer(semantic))
+		if config.OpenRouterContentModel != "" {
+			clientConfig.Model = config.OpenRouterContentModel
+			content, err := openrouter.NewClient(clientConfig)
+			if err != nil {
+				return err
+			}
+			semanticOptions = append(semanticOptions, moderation.WithContentAnalyzer(content, profiles, config.OpenRouterContentChatID))
+			if config.AdvertisingAutobanChatID != 0 {
+				clientConfig.Model = config.OpenRouterBanModel
+				verifier, err := openrouter.NewClient(clientConfig)
+				if err != nil {
+					return err
+				}
+				semanticOptions = append(semanticOptions, moderation.WithAdvertisingAutoban(config.AdvertisingAutobanChatID, verifier))
+			}
 		}
 	}
 	var imageOCR *mediaocr.Extractor
@@ -87,6 +105,7 @@ func run(ctx context.Context, config config) error {
 		config.NATSURL,
 		nats.Name("antispambee-moderation-worker"),
 		nats.Timeout(5*time.Second),
+		nats.MaxReconnects(-1),
 	)
 	if err != nil {
 		return fmt.Errorf("connect to NATS: %w", err)
@@ -111,7 +130,7 @@ func run(ctx context.Context, config config) error {
 		)
 		if err == nil {
 			cancelProvision()
-			return consume(ctx, consumer, pool, profiles, semantic, imageOCR, config.RetryDelay, config.ModeratorChatID, config.HTTPAddress)
+			return consume(ctx, consumer, connection.IsConnected, pool, profiles, semanticOptions, imageOCR, config)
 		}
 	}
 	cancelProvision()
@@ -121,13 +140,12 @@ func run(ctx context.Context, config config) error {
 func consume(
 	ctx context.Context,
 	consumer jetstream.Consumer,
+	queueConnected func() bool,
 	pool *pgxpool.Pool,
 	profiles *telegramapi.Client,
-	semantic *openrouter.Client,
+	semanticOptions []moderation.ProcessorOption,
 	imageOCR *mediaocr.Extractor,
-	retryDelay time.Duration,
-	moderatorChatID int64,
-	httpAddress string,
+	config config,
 ) error {
 	store, err := postgresstore.New(pool)
 	if err != nil {
@@ -137,8 +155,9 @@ func consume(
 		moderation.WithBehaviorStore(store),
 		moderation.WithPolicyStore(store),
 	}
-	if semantic != nil {
-		options = append(options, moderation.WithSemanticAnalyzer(semantic))
+	options = append(options, semanticOptions...)
+	if config.ModerationOperationsChatID != 0 {
+		options = append(options, moderation.WithModerationOperations(config.ModerationOperationsChatID, []byte(config.TelegramBotToken), store))
 	}
 	if imageOCR != nil {
 		options = append(options, moderation.WithImageTextExtractor(imageOCR))
@@ -153,11 +172,11 @@ func consume(
 	if err != nil {
 		return err
 	}
-	router, err := moderation.NewCommandRouter(store, profiles, processor, moderatorChatID, botUsername)
+	router, err := moderation.NewCommandRouter(store, profiles, processor, config.ModeratorChatID, botUsername)
 	if err != nil {
 		return err
 	}
-	handler, err := eventstream.NewHandler(router, retryDelay)
+	handler, err := eventstream.NewHandler(router, config.RetryDelay, eventstream.WithProcessedEventStore(store))
 	if err != nil {
 		return err
 	}
@@ -167,11 +186,15 @@ func consume(
 		func(message jetstream.Msg) {
 			if err := handler.Handle(ctx, message); err != nil {
 				metrics.failed.Add(1)
+				if errors.Is(err, moderation.ErrContentUnavailable) {
+					metrics.modelRetries.Add(1)
+				}
 				slog.Error("moderation event processing failed", "error", err)
 				return
 			}
 			metrics.processed.Add(1)
 		},
+		jetstream.PullMaxMessages(eventstream.ModerationPullBatchSize),
 		jetstream.ConsumeErrHandler(func(_ jetstream.ConsumeContext, err error) {
 			slog.Error("JetStream consumer error", "error", err)
 		}),
@@ -180,12 +203,26 @@ func consume(
 		return fmt.Errorf("start moderation consumer: %w", err)
 	}
 
-	server := moderationHealthServer(httpAddress, pool, metrics)
+	if config.ModerationOperationsChatID != 0 {
+		monitorCtx, cancelMonitor := context.WithCancel(ctx)
+		monitorDone := make(chan struct{})
+		go func() {
+			defer close(monitorDone)
+			monitorOperations(monitorCtx, config.ModerationOperationsChatID, consumer, store, profiles, metrics)
+		}()
+		defer func() { cancelMonitor(); <-monitorDone }()
+	}
+	server := moderationHealthServer(config.HTTPAddress, pool, queueConnected, metrics)
 	serverErrors := make(chan error, 1)
 	go func() { serverErrors <- server.ListenAndServe() }()
 	slog.Info("moderation worker started")
+	var consumeErr error
 	select {
 	case <-ctx.Done():
+	case <-consumeContext.Closed():
+		if ctx.Err() == nil {
+			consumeErr = fmt.Errorf("moderation consumer stopped unexpectedly")
+		}
 	case err := <-serverErrors:
 		if !errors.Is(err, http.ErrServerClosed) {
 			consumeContext.Stop()
@@ -201,7 +238,7 @@ func consume(
 
 	select {
 	case <-consumeContext.Closed():
-		return nil
+		return consumeErr
 	case <-time.After(10 * time.Second):
 		consumeContext.Stop()
 		return fmt.Errorf("drain moderation consumer: timeout")
@@ -209,16 +246,21 @@ func consume(
 }
 
 type workerMetrics struct {
-	processed atomic.Uint64
-	failed    atomic.Uint64
+	processed    atomic.Uint64
+	failed       atomic.Uint64
+	modelRetries atomic.Uint64
 }
 
-func moderationHealthServer(address string, pool *pgxpool.Pool, metrics *workerMetrics) *http.Server {
+func moderationHealthServer(address string, pool *pgxpool.Pool, queueConnected func() bool, metrics *workerMetrics) *http.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
 	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, request *http.Request) {
+		if !queueConnected() {
+			http.Error(w, "not ready", http.StatusServiceUnavailable)
+			return
+		}
 		ctx, cancel := context.WithTimeout(request.Context(), time.Second)
 		defer cancel()
 		if err := pool.Ping(ctx); err != nil {

@@ -275,6 +275,23 @@ func TestMessageAdDetectorDoesNotFlagNeutralSensitiveTopics(t *testing.T) {
 	}
 }
 
+func TestMessageAdDetectorDoesNotTreatAdultMentionsOrMusicAsAdultOffers(t *testing.T) {
+	for _, text := range []string{
+		"Интимные видео украли у пользователей — новость https://news.example.com",
+		"OnlyFans изменил правила: подробности https://news.example.com",
+		"XXX — мой новый альбом. Подписывайся https://music.example.com",
+		"OnlyFans 18+ — мой музыкальный блог. Подпишись https://music.example.com",
+		"Девушки выступают на концерте 18+. В нашем канале видео https://music.example.com",
+		"Сравниваем webcam для стриминга, смотрите видео https://tech.example.com",
+		"Запись концерта есть в нашем канале https://music.example.com",
+	} {
+		signal := NewMessageAdDetector().Analyze(MessageContent{Text: text})
+		if signal.Score != nil && *signal.Score >= .9 {
+			t.Errorf("neutral text %q recognized as advertising: %+v", text, signal)
+		}
+	}
+}
+
 func TestMessageAdDetectorDoesNotFlagNeutralVPNDiscussion(t *testing.T) {
 	detector := newMessageAdDetector(time.Now)
 

@@ -18,10 +18,38 @@ type commandStoreStub struct {
 	personalPolicies []CommunityPolicy
 	history          []HistoryEntry
 	historyRead      bool
+	commandCommits   map[string]bool
+	recordErr        error
 }
 
-func (s *commandStoreStub) RecordTerminal(_ context.Context, _ events.TelegramUpdate, outcome Outcome) error {
+func (s *commandStoreStub) RecordTerminal(_ context.Context, event events.TelegramUpdate, outcome Outcome) error {
+	if s.recordErr != nil {
+		return s.recordErr
+	}
 	s.outcome = outcome
+	if outcome.Command != nil {
+		if s.commandCommits == nil {
+			s.commandCommits = make(map[string]bool)
+		}
+		if s.commandCommits[event.EventID] {
+			return nil
+		}
+		s.commandCommits[event.EventID] = true
+		m := outcome.Command.Mutation
+		if m.ProtectionLevel != "" {
+			s.policyLevel = m.ProtectionLevel
+		}
+		if m.ModeratorUserID != 0 {
+			s.moderatorID = m.ModeratorUserID
+		}
+		if m.Allowlist != nil {
+			if m.Allowlist.Allowed {
+				s.allowlisted = m.Allowlist.UserID
+			} else {
+				s.allowlisted = 0
+			}
+		}
+	}
 	return nil
 }
 func (s *commandStoreStub) RecordUserReport(_ context.Context, _ string, chatID, reporterID, reportedID, messageID int64) error {
@@ -190,8 +218,8 @@ func TestCommandRouterChangesProtectionLevelForAnonymousAdmin(t *testing.T) {
 	if store.moderatorID != 9 {
 		t.Fatalf("anonymous Telegram identity replaced moderator: %d", store.moderatorID)
 	}
-	if len(telegram.messages) != 1 || !strings.Contains(telegram.messages[0], "STRICT") {
-		t.Fatalf("messages = %q", telegram.messages)
+	if store.outcome.Command == nil || len(store.outcome.Command.Replies) != 1 || !strings.Contains(store.outcome.Command.Replies[0].Text, "STRICT") || len(telegram.messages) != 0 {
+		t.Fatalf("queued command reply = %+v, immediate messages = %q", store.outcome.Command, telegram.messages)
 	}
 }
 
@@ -269,8 +297,8 @@ func TestCommandRouterLinksGroupFromPrivateChatAfterAdminCheck(t *testing.T) {
 	if store.moderatorID != 1 {
 		t.Fatalf("moderator ID = %d", store.moderatorID)
 	}
-	if len(telegram.messages) != 1 || !strings.Contains(telegram.messages[0], "Вторая группа") {
-		t.Fatalf("messages = %q", telegram.messages)
+	if store.outcome.Command == nil || len(store.outcome.Command.Replies) != 1 || !strings.Contains(store.outcome.Command.Replies[0].Text, "Вторая группа") || len(telegram.messages) != 0 {
+		t.Fatalf("queued command reply = %+v, immediate messages = %q", store.outcome.Command, telegram.messages)
 	}
 }
 

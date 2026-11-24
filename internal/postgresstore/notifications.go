@@ -60,6 +60,8 @@ func (s *Store) FinishNotification(ctx context.Context, n moderation.ClaimedNoti
 // is performed on a delivery iteration. Live archive reads also check expiry.
 func (s *Store) PurgeExpiredEvidence(ctx context.Context) error {
 	for _, query := range []string{
+		`DELETE FROM moderation_campaign_observations WHERE ctid IN (SELECT ctid FROM moderation_campaign_observations WHERE observed_at <= now()-interval '24 hours' ORDER BY observed_at LIMIT 100)`,
+		`DELETE FROM moderation_command_reply_outbox WHERE reply_id IN (SELECT reply_id FROM moderation_command_reply_outbox WHERE expires_at <= now() ORDER BY expires_at LIMIT 100)`,
 		`DELETE FROM moderation_evidence WHERE event_id IN (SELECT event_id FROM moderation_evidence WHERE expires_at <= now() ORDER BY expires_at LIMIT 100)`,
 		`DELETE FROM moderation_notification_outbox WHERE action_id IN (SELECT action_id FROM moderation_notification_outbox WHERE expires_at <= now() ORDER BY expires_at LIMIT 100)`,
 	} {

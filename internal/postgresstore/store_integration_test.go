@@ -26,7 +26,7 @@ func TestStoreRecordTerminalIsIdempotent(t *testing.T) {
 	}
 	t.Cleanup(pool.Close)
 
-	if _, err := pool.Exec(ctx, "TRUNCATE moderation_evidence, moderation_notification_outbox, user_reports, moderation_allowlist, community_policies, message_activity, moderation_audit_log, moderation_actions, moderation_decisions, detector_signals, moderation_event_features, moderation_events"); err != nil {
+	if _, err := pool.Exec(ctx, "TRUNCATE moderation_command_reply_outbox, moderation_command_commits, moderation_reviews, moderation_evidence, moderation_notification_outbox, user_reports, moderation_allowlist, community_policies, message_activity, moderation_audit_log, moderation_actions, moderation_decisions, detector_signals, moderation_event_features, moderation_events"); err != nil {
 		t.Fatalf("truncate moderation_events: %v", err)
 	}
 

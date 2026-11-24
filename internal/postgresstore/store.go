@@ -12,12 +12,17 @@ import (
 	"antispambee/internal/moderation"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // Store persists terminal moderation outcomes in PostgreSQL.
 type Store struct {
 	pool *pgxpool.Pool
+}
+
+type statementExecutor interface {
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
 }
 
 // ClaimAction leases the oldest due action. Expired leases are recoverable.
@@ -71,7 +76,8 @@ func (s *Store) ClaimAction(
 			action.notification_message,
 			action.notification_reasons,
 			action.notification_risk_score,
-			(SELECT authorization_reason FROM moderation_decisions WHERE decision_id = action.decision_id)
+			CASE WHEN action.manual_review THEN 'MODERATOR_COMMAND'
+			ELSE (SELECT authorization_reason FROM moderation_decisions WHERE decision_id = action.decision_id) END
 	`, owner, lease.Milliseconds()).Scan(
 		&action.ActionID,
 		&action.EventID,
@@ -125,7 +131,7 @@ func (s *Store) MarkActionSucceeded(
 		status = "SUCCEEDED_ASSUMED"
 		operation = "ACTION_SUCCEEDED_ASSUMED"
 	}
-	return s.finishAction(ctx, action, status, moderation.ProcessedAction, operation, "")
+	return s.finishAction(ctx, action, status, operation, "")
 }
 
 // MarkActionRetryable releases a lease and schedules another attempt.
@@ -139,8 +145,8 @@ func (s *Store) MarkActionRetryable(
 		UPDATE moderation_actions
 		SET status = 'RETRYABLE', next_attempt_at = $3, last_error = $4,
 			lease_owner = NULL, lease_until = NULL, updated_at = now()
-		WHERE action_id = $1 AND status = 'CLAIMED' AND lease_owner = $2
-	`, action.ActionID, action.LeaseOwner, next, message)
+		WHERE action_id = $1 AND status = 'CLAIMED' AND lease_owner = $2 AND attempt_count = $5
+	`, action.ActionID, action.LeaseOwner, next, message, action.AttemptCount)
 	if err != nil {
 		return fmt.Errorf("mark moderation action retryable: %w", err)
 	}
@@ -156,19 +162,18 @@ func (s *Store) MarkActionPermanentFailure(
 	action moderation.ClaimedAction,
 	message string,
 ) error {
-	return s.finishAction(ctx, action, "PERMANENT_FAILED", moderation.TerminalState("DEAD_LETTER"), "ACTION_FAILED", message)
+	return s.finishAction(ctx, action, "PERMANENT_FAILED", "ACTION_FAILED", message)
 }
 
 // MarkActionCancelled records a policy veto without reporting a Telegram failure.
 func (s *Store) MarkActionCancelled(ctx context.Context, action moderation.ClaimedAction, message string) error {
-	return s.finishAction(ctx, action, "CANCELLED", moderation.ProcessedReview, "ACTION_CANCELLED", message)
+	return s.finishAction(ctx, action, "CANCELLED", "ACTION_CANCELLED", message)
 }
 
 func (s *Store) finishAction(
 	ctx context.Context,
 	action moderation.ClaimedAction,
 	actionStatus string,
-	eventStatus moderation.TerminalState,
 	operation string,
 	message string,
 ) error {
@@ -177,6 +182,11 @@ func (s *Store) finishAction(
 		return fmt.Errorf("begin moderation action completion: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	// Serialize completions for one event so a successful delete cannot hide a
+	// failed ban and concurrent actions cannot leave the event pending forever.
+	if _, err := tx.Exec(ctx, `SELECT event_id FROM moderation_events WHERE event_id = $1 FOR UPDATE`, action.EventID); err != nil {
+		return fmt.Errorf("lock moderation event for action completion: %w", err)
+	}
 	command, err := tx.Exec(ctx, `
 		UPDATE moderation_actions
 		SET status = $3, last_error = NULLIF($4, ''), lease_owner = NULL,
@@ -184,8 +194,8 @@ func (s *Store) finishAction(
 			notification_author_username = '', notification_author_user_id = 0,
 			notification_message = '', notification_reasons = '{}',
 			notification_risk_score = 0, updated_at = now()
-		WHERE action_id = $1 AND status = 'CLAIMED' AND lease_owner = $2
-	`, action.ActionID, action.LeaseOwner, actionStatus, message)
+		WHERE action_id = $1 AND status = 'CLAIMED' AND lease_owner = $2 AND attempt_count = $5
+	`, action.ActionID, action.LeaseOwner, actionStatus, message, action.AttemptCount)
 	if err != nil {
 		return fmt.Errorf("complete moderation action: %w", err)
 	}
@@ -205,9 +215,14 @@ func (s *Store) finishAction(
 		}
 	}
 	if _, err := tx.Exec(ctx, `
-		UPDATE moderation_events SET terminal_state = $2, processed_at = now()
+		UPDATE moderation_events SET terminal_state = CASE
+			WHEN EXISTS (SELECT 1 FROM moderation_actions WHERE event_id = $1 AND status IN ('PENDING','CLAIMED','RETRYABLE')) THEN 'DECIDED_PENDING_ACTION'
+			WHEN EXISTS (SELECT 1 FROM moderation_actions WHERE event_id = $1 AND status = 'PERMANENT_FAILED') THEN 'DEAD_LETTER'
+			WHEN EXISTS (SELECT 1 FROM moderation_actions WHERE event_id = $1 AND status = 'CANCELLED') THEN 'PROCESSED_REVIEW'
+			ELSE 'PROCESSED_ACTION'
+		END, processed_at = now()
 		WHERE event_id = $1
-	`, action.EventID, eventStatus); err != nil {
+	`, action.EventID); err != nil {
 		return fmt.Errorf("complete moderation event: %w", err)
 	}
 	details, err := json.Marshal(map[string]any{
@@ -399,10 +414,18 @@ func (s *Store) SetCommunityModerator(
 	tenantID string,
 	chatID, moderatorChatID int64,
 ) error {
+	return setCommunityModerator(ctx, s.pool, tenantID, chatID, moderatorChatID)
+}
+
+func setCommunityModerator(
+	ctx context.Context, db statementExecutor,
+	tenantID string,
+	chatID, moderatorChatID int64,
+) error {
 	if tenantID == "" || chatID == 0 || moderatorChatID <= 0 {
 		return fmt.Errorf("valid tenant, chat, and moderator are required")
 	}
-	command, err := s.pool.Exec(ctx, `
+	command, err := db.Exec(ctx, `
 		INSERT INTO community_policies (
 			tenant_id, chat_id, protection_level, automatic_actions_enabled, autoban_enabled, moderator_chat_id, admin_sender_chat_id
 		)
@@ -423,10 +446,16 @@ func (s *Store) SetCommunityModerator(
 func (s *Store) SetCommunityModeratorSenderChat(
 	ctx context.Context, tenantID string, chatID, moderatorChatID, senderChatID int64,
 ) error {
+	return setCommunityModeratorSenderChat(ctx, s.pool, tenantID, chatID, moderatorChatID, senderChatID)
+}
+
+func setCommunityModeratorSenderChat(
+	ctx context.Context, db statementExecutor, tenantID string, chatID, moderatorChatID, senderChatID int64,
+) error {
 	if tenantID == "" || chatID == 0 || moderatorChatID <= 0 || senderChatID == 0 {
 		return fmt.Errorf("valid tenant, chat, moderator, and sender chat are required")
 	}
-	_, err := s.pool.Exec(ctx, `
+	_, err := db.Exec(ctx, `
 		INSERT INTO community_policies (
 			tenant_id, chat_id, protection_level, automatic_actions_enabled, autoban_enabled, moderator_chat_id, admin_sender_chat_id
 		) VALUES ($1, $2, 'STRICT', TRUE, TRUE, $3, $4)
@@ -472,9 +501,18 @@ func (s *Store) SetCommunityProtection(
 	chatID int64,
 	level string,
 ) error {
+	return setCommunityProtection(ctx, s.pool, tenantID, chatID, level)
+}
+
+func setCommunityProtection(
+	ctx context.Context, db statementExecutor,
+	tenantID string,
+	chatID int64,
+	level string,
+) error {
 	automaticActions := level == "STANDARD" || level == "STRICT"
 	autoban := level == "STRICT"
-	command, err := s.pool.Exec(ctx, `
+	command, err := db.Exec(ctx, `
 		INSERT INTO community_policies (
 			tenant_id, chat_id, protection_level, automatic_actions_enabled, autoban_enabled
 		)
@@ -503,8 +541,19 @@ func (s *Store) SetAllowlisted(
 	addedBy int64,
 	allowed bool,
 ) error {
+	return setAllowlisted(ctx, s.pool, tenantID, chatID, userID, addedBy, allowed)
+}
+
+func setAllowlisted(
+	ctx context.Context, db statementExecutor,
+	tenantID string,
+	chatID int64,
+	userID int64,
+	addedBy int64,
+	allowed bool,
+) error {
 	if allowed {
-		_, err := s.pool.Exec(ctx, `
+		_, err := db.Exec(ctx, `
 			INSERT INTO moderation_allowlist (tenant_id, chat_id, user_id, added_by)
 			VALUES ($1, $2, $3, $4)
 			ON CONFLICT (tenant_id, chat_id, user_id) DO UPDATE
@@ -515,7 +564,7 @@ func (s *Store) SetAllowlisted(
 		}
 		return nil
 	}
-	if _, err := s.pool.Exec(ctx, `
+	if _, err := db.Exec(ctx, `
 		DELETE FROM moderation_allowlist
 		WHERE tenant_id = $1 AND chat_id = $2 AND user_id = $3
 	`, tenantID, chatID, userID); err != nil {
@@ -544,6 +593,29 @@ func (s *Store) RecordUserReport(
 		return fmt.Errorf("record user report: %w", err)
 	}
 	return nil
+}
+
+// ModerationEventProcessed avoids repeating enrichment for committed decisions.
+// Match the complete durable identity. Legacy commands still deliver replies
+// in the router; transactional commands deliver them through the outbox.
+func (s *Store) ModerationEventProcessed(ctx context.Context, event events.TelegramUpdate) (bool, error) {
+	var processed bool
+	err := s.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM moderation_events e
+			JOIN moderation_decisions d ON d.event_id = e.event_id
+			WHERE e.event_id = $1 AND e.tenant_id = $2 AND e.source_key = $3
+				AND e.bot_id = $4 AND e.telegram_update_id = $5 AND e.schema_version = $6
+				AND (d.authorization_reason <> $7 OR EXISTS (
+					SELECT 1 FROM moderation_command_commits c WHERE c.event_id=e.event_id AND c.tenant_id=e.tenant_id
+				))
+		)
+	`, event.EventID, event.TenantID, event.SourceKey, event.BotID, event.UpdateID,
+		event.SchemaVersion, moderation.ReasonModeratorCommand).Scan(&processed)
+	if err != nil {
+		return false, fmt.Errorf("query committed moderation event: %w", err)
+	}
+	return processed, nil
 }
 
 // RecordTerminal inserts an outcome once. A retry of the same event succeeds
@@ -630,7 +702,8 @@ func (s *Store) RecordTerminal(
 			matched_rules,
 			created_at
 		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+			COALESCE($11::text[], '{}'::text[]), COALESCE($12::text[], '{}'::text[]), $13)
 		ON CONFLICT (event_id, detector, detector_version) DO NOTHING
 		`,
 			event.EventID,
@@ -691,6 +764,11 @@ func (s *Store) RecordTerminal(
 	if err != nil {
 		return fmt.Errorf("insert moderation decision for event %q: %w", event.SourceKey, err)
 	}
+	if outcome.Command != nil {
+		if err := persistCommandCommit(ctx, tx, event, outcome, decisionInserted); err != nil {
+			return err
+		}
+	}
 	if decisionInserted {
 		if _, err := tx.Exec(ctx, `UPDATE moderation_decisions SET decision_version=$2 WHERE decision_id=$1`, decisionID, moderation.DecisionPolicyVersion); err != nil {
 			return err
@@ -706,6 +784,9 @@ func (s *Store) RecordTerminal(
 			if _, err := tx.Exec(ctx, `INSERT INTO moderation_evidence(event_id,tenant_id,chat_id,message_id,snapshot)
 				VALUES ($1,$2,$3,$4,$5) ON CONFLICT (event_id) DO NOTHING`, event.EventID, event.TenantID, outcome.Evidence.Target.ChatID, outcome.Evidence.Target.MessageID, snapshot); err != nil {
 				return fmt.Errorf("persist moderation evidence: %w", err)
+			}
+			if err := enqueueReview(ctx, tx, event, outcome); err != nil {
+				return err
 			}
 		}
 	}

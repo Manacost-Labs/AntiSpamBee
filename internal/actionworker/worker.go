@@ -29,6 +29,7 @@ var errActionCancelled = errors.New("action cancelled by moderation policy")
 
 // Repository owns action leasing and durable state transitions.
 type Repository interface {
+	GetCommunityPolicy(context.Context, string, int64, int64) (moderation.CommunityPolicy, error)
 	ClaimAction(context.Context, string, time.Duration) (moderation.ClaimedAction, bool, error)
 	MarkActionSucceeded(context.Context, moderation.ClaimedAction, bool) error
 	MarkActionRetryable(context.Context, moderation.ClaimedAction, time.Time, string) error
@@ -36,6 +37,8 @@ type Repository interface {
 	MarkActionCancelled(context.Context, moderation.ClaimedAction, string) error
 	ClaimNotification(context.Context, string, time.Duration) (moderation.ClaimedNotification, bool, error)
 	FinishNotification(context.Context, moderation.ClaimedNotification, string, time.Time, string) error
+	ClaimCommandReply(context.Context, string, time.Duration) (moderation.ClaimedCommandReply, bool, error)
+	FinishCommandReply(context.Context, moderation.ClaimedCommandReply, string, time.Time, string) error
 	NotificationRecipientCurrent(context.Context, moderation.ClaimedNotification) (bool, error)
 	PurgeExpiredEvidence(context.Context) error
 }
@@ -90,7 +93,8 @@ func (w *Worker) RunOnce(ctx context.Context) (bool, error) {
 	}
 	worked, actionErr := w.runActionOnce(ctx)
 	notified, notificationErr := w.runNotificationOnce(ctx)
-	return worked || notified, errors.Join(actionErr, notificationErr)
+	replied, replyErr := w.runCommandReplyOnce(ctx)
+	return worked || notified || replied, errors.Join(actionErr, notificationErr, replyErr)
 }
 
 func (w *Worker) runActionOnce(ctx context.Context) (bool, error) {
@@ -107,7 +111,7 @@ func (w *Worker) runActionOnce(ctx context.Context) (bool, error) {
 		if err := w.repository.MarkActionSucceeded(ctx, action, assumed); err != nil {
 			return true, fmt.Errorf("mark moderation action succeeded: %w", err)
 		}
-		if action.Type == moderation.ActionBanUser {
+		if action.Type == moderation.ActionBanUser && action.AuthorizationReason != moderation.ReasonConfirmedAdvertisingAutoban {
 			message := fmt.Sprintf("⛔ Пользователь %d заблокирован модерацией AntiSpamBee.", action.Target.UserID)
 			if err := w.telegram.SendMessage(ctx, action.Target.ChatID, message); err != nil {
 				slog.Warn("send Telegram ban notification failed", "action_id", action.ActionID, "error", err)
@@ -178,6 +182,22 @@ func deletionReasonLabel(reason string) string {
 		return "массовая вакансия"
 	case "ADULT_CONTENT":
 		return "контент 18+"
+	case moderation.ReasonConfirmedAdultChannel:
+		return "порнографический или эротический канал в профиле"
+	case moderation.ReasonConfirmedFraudChannel:
+		return "мошенническое предложение в канале профиля"
+	case moderation.ReasonConfirmedProfileAdvertising:
+		return "подтверждённая реклама в профиле"
+	case "SERVICE_OFFER":
+		return "реклама услуг"
+	case "ACCOUNT_TRADE":
+		return "торговля аккаунтами или идентификаторами"
+	case "SUBSCRIPTION_SALE":
+		return "продажа подписок"
+	case "INFORMAL_JOB_OFFER":
+		return "реклама работы"
+	case "OPAQUE_TRADE_OFFER":
+		return "торговое предложение с ценой и специальным жаргоном"
 	case "DUPLICATE_SPAM":
 		return "повторяющийся спам"
 	case "MESSAGE_FLOOD":
@@ -219,27 +239,86 @@ func (w *Worker) execute(ctx context.Context, action moderation.ClaimedAction) (
 				return false, fmt.Errorf("%w: message author is an administrator", errActionCancelled)
 			}
 		}
-		return false, w.telegram.DeleteMessage(ctx, target.ChatID, target.MessageID)
+		if err := w.checkCurrentPolicy(ctx, action); err != nil {
+			return false, err
+		}
+		err := w.telegram.DeleteMessage(ctx, target.ChatID, target.MessageID)
+		var apiErr *telegramapi.APIError
+		if errors.As(err, &apiErr) && apiErr.ErrorCode == 400 && strings.Contains(strings.ToLower(apiErr.Description), "message to delete not found") {
+			return true, nil
+		}
+		return false, err
 	case moderation.ActionDeleteReaction:
+		if err := w.checkCurrentPolicy(ctx, action); err != nil {
+			return false, err
+		}
 		return false, w.telegram.DeleteMessageReaction(ctx, target.ChatID, target.MessageID, target.UserID)
 	case moderation.ActionBanUser:
-		if action.AttemptCount > 1 {
-			status, err := w.telegram.GetChatMemberStatus(ctx, target.ChatID, target.UserID)
-			if err != nil {
-				return false, fmt.Errorf("reconcile Telegram ban: %w", err)
-			}
-			if status == "kicked" {
-				return true, nil
-			}
+		if target.UserID <= 0 || target.UserID == 777000 || target.UserID == 1087968824 {
+			return false, fmt.Errorf("%w: ban target identity is unavailable", errActionCancelled)
+		}
+		status, err := w.telegram.GetChatMemberStatus(ctx, target.ChatID, target.UserID)
+		if err != nil {
+			return false, fmt.Errorf("check member before Telegram ban: %w", err)
+		}
+		if status == "administrator" || status == "creator" {
+			return false, fmt.Errorf("%w: ban target is an administrator", errActionCancelled)
+		}
+		if err := w.checkCurrentPolicy(ctx, action); err != nil {
+			return false, err
+		}
+		if status == "kicked" {
+			return true, nil
 		}
 		return false, w.telegram.BanChatMember(ctx, target.ChatID, target.UserID)
 	case moderation.ActionMuteUser:
+		if err := w.checkCurrentPolicy(ctx, action); err != nil {
+			return false, err
+		}
 		return false, w.telegram.RestrictChatMember(ctx, target.ChatID, target.UserID, action.UntilDate)
 	case moderation.ActionUnbanUser:
+		if err := w.checkCurrentPolicy(ctx, action); err != nil {
+			return false, err
+		}
 		return false, w.telegram.UnbanChatMember(ctx, target.ChatID, target.UserID)
 	default:
 		return false, fmt.Errorf("unsupported moderation action %q", action.Type)
 	}
+}
+
+// Manual commands carry their own authorization. Automatic actions must still
+// be permitted by the community at execution time, including on every retry.
+func (w *Worker) checkCurrentPolicy(ctx context.Context, action moderation.ClaimedAction) error {
+	if action.AuthorizationReason == moderation.ReasonModeratorCommand {
+		return nil
+	}
+	policy, err := w.repository.GetCommunityPolicy(ctx, action.TenantID, action.Target.ChatID, action.Target.UserID)
+	if err != nil {
+		return fmt.Errorf("read current policy before automatic action: %w", err)
+	}
+	if policy.IsAllowlisted {
+		return fmt.Errorf("%w: target is now allowlisted", errActionCancelled)
+	}
+	if !policy.AutomaticActionsEnabled || policy.ProtectionLevel == "OBSERVE" {
+		return fmt.Errorf("%w: automatic actions are now disabled", errActionCancelled)
+	}
+	if policy.ProtectionLevel != "STRICT" && policy.ProtectionLevel != "STANDARD" {
+		return fmt.Errorf("%w: unsupported protection level", errActionCancelled)
+	}
+	if action.Type == moderation.ActionBanUser && !policy.AutobanEnabled {
+		return fmt.Errorf("%w: automatic bans are now disabled", errActionCancelled)
+	}
+	profileAction := action.Type == moderation.ActionBanUser
+	switch action.AuthorizationReason {
+	case moderation.ReasonConfirmedAdvertisingChannel, moderation.ReasonConfirmedAdultAdvertisingChannel, moderation.ReasonConfirmedProfileAdvertising,
+		moderation.ReasonConfirmedAdvertisingAutoban,
+		moderation.ReasonConfirmedAdultChannel, moderation.ReasonConfirmedFraudChannel, moderation.ReasonAutobanDisabled:
+		profileAction = true
+	}
+	if profileAction && policy.ProtectionLevel != "STRICT" {
+		return fmt.Errorf("%w: profile enforcement now requires STRICT protection", errActionCancelled)
+	}
+	return nil
 }
 
 func isRetryable(err error) bool {

@@ -12,6 +12,10 @@ type consumerManager interface {
 	CreateOrUpdateConsumer(context.Context, string, jetstream.ConsumerConfig) (jetstream.Consumer, error)
 }
 
+// The moderation callback is sequential. Do not prefetch events whose ACK
+// timers would start before Handler can maintain their progress window.
+const ModerationPullBatchSize = 1
+
 // EnsureModerationConsumer provisions the durable pull consumer used by the
 // moderation worker. Unlimited delivery keeps database outages retryable.
 func EnsureModerationConsumer(

@@ -3,14 +3,52 @@ package telegramapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 
 	"antispambee/internal/detection"
 )
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) { return f(request) }
+
+func TestClientNeverIncludesBotTokenInNetworkErrors(t *testing.T) {
+	for _, download := range []bool{false, true} {
+		t.Run(fmt.Sprintf("download=%v", download), func(t *testing.T) {
+			const token = "fixture-private-token"
+			networkErr := errors.New("network is unavailable")
+			transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+				if download && strings.HasSuffix(request.URL.Path, "/getFile") {
+					return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"ok":true,"result":{"file_path":"photo.jpg"}}`))}, nil
+				}
+				return nil, networkErr
+			})
+			client, err := NewClient(ClientConfig{Token: token, BaseURL: "https://example.com", HTTPClient: &http.Client{Transport: transport}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if download {
+				_, err = client.DownloadFile(context.Background(), "file-id", 1024)
+			} else {
+				_, err = client.GetChatMemberStatus(context.Background(), -1001, 42)
+			}
+			if err == nil || strings.Contains(err.Error(), token) {
+				t.Fatal("network error exposes the bot token")
+			}
+			if !errors.Is(err, networkErr) {
+				t.Fatal("redaction must retain the original error for retry handling")
+			}
+		})
+	}
+}
 
 func TestClientFetchProfileIncludesPersonalChannelPosts(t *testing.T) {
 	requests := []string{}
@@ -31,7 +69,7 @@ func TestClientFetchProfileIncludesPersonalChannelPosts(t *testing.T) {
 		case r.URL.Path == "/botsecret/getChat" && body.ChatID == -1009001:
 			_, _ = w.Write([]byte(`{"ok":true,"result":{"id":-1009001,"type":"channel","title":"И там и здесь","username":"job_offer","description":"Нужны сотрудники на частичную занятость"}}`))
 		case r.URL.Path == "/botsecret/getUserPersonalChatMessages" && body.UserID == 8373323792 && body.Limit == 5:
-			_, _ = w.Write([]byte(`{"ok":true,"result":[{"message_id":1,"text":"Пишите в личку"},{"message_id":2,"caption":"Свободный график"},{"message_id":3,"audio":{"file_id":"song"}},{"message_id":4,"channel_chat_created":true}]}`))
+			_, _ = w.Write([]byte(`{"ok":true,"result":[{"message_id":1,"text":"Пишите в личку"},{"message_id":2,"caption":"Свободный график","photo":[{"file_id":"sized-preview","file_size":1500000,"width":640,"height":480},{"file_id":"oversize-preview","file_size":3000000,"width":1280,"height":960}]},{"message_id":3,"audio":{"file_id":"song"}},{"message_id":4,"channel_chat_created":true},{"message_id":5,"new_chat_photo":[{"file_id":"channel-photo"}]},{"message_id":6,"new_chat_title":"Коллекция 18+"},{"message_id":7,"pinned_message":{"message_id":1,"text":"Пишите в личку"}},{"message_id":8,"delete_chat_photo":true},{"message_id":9,"message_auto_delete_timer_changed":{"message_auto_delete_time":86400}}]}`))
 		default:
 			http.Error(w, "unexpected request", http.StatusBadRequest)
 		}
@@ -56,10 +94,11 @@ func TestClientFetchProfileIncludesPersonalChannelPosts(t *testing.T) {
 		Username: "Kristinana04Alekseeva",
 		Bio:      "Добрая, но не для всех",
 		PersonalChannel: &detection.PersonalChannel{
-			Title:       "И там и здесь",
-			Username:    "job_offer",
-			Description: "Нужны сотрудники на частичную занятость",
-			RecentPosts: []string{"Пишите в личку", "Свободный график", ""},
+			Title:              "И там и здесь",
+			Username:           "job_offer",
+			Description:        "Нужны сотрудники на частичную занятость",
+			RecentPosts:        []string{"Пишите в личку", "Свободный график", ""},
+			RecentPostImageIDs: []string{"", "sized-preview"},
 		},
 	}
 	if !reflect.DeepEqual(profile, want) {

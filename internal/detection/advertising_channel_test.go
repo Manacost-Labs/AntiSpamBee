@@ -50,3 +50,45 @@ func TestAdvertisingChannelDetectorRequiresCompleteOffersInEveryPost(t *testing.
 		})
 	}
 }
+
+func TestAdvertisingChannelDetectorConfirmsAdultPromotionFromChannelContext(t *testing.T) {
+	post := "😘 Горячие ролики. Доступ по заявке в канал 👉 https://t.me/+exampleInvite"
+	for _, tc := range []struct {
+		name      string
+		channel   PersonalChannel
+		wantAdult bool
+	}{
+		{"screenshot", PersonalChannel{Title: "✨ Закрытый коллекция 18+", RecentPosts: []string{post}}, true},
+		{"spaced age label", PersonalChannel{Title: "Коллекция 18 +", RecentPosts: []string{post}}, true},
+		{"unicode age label", PersonalChannel{Title: "Коллекция １８＋", RecentPosts: []string{post}}, true},
+		{"nonbreaking age space", PersonalChannel{Title: "Коллекция 18\u00a0+", RecentPosts: []string{post}}, true},
+		{"adult description", PersonalChannel{Title: "Коллекция", Description: "Закрытая коллекция 18+", RecentPosts: []string{post}}, true},
+		{"adult caption", PersonalChannel{RecentPosts: []string{"Горячие ролики 18+. Доступ по заявке https://t.me/+exampleInvite"}}, true},
+		{"explicit adult promotion", PersonalChannel{RecentPosts: []string{"Интимные видео, доступ в канал https://t.me/+exampleInvite"}}, true},
+		{"ordinary music marked 18+", PersonalChannel{Title: "Музыка 18+", RecentPosts: []string{"Мой новый альбом. Слушайте https://example.com"}}, false},
+		{"news linking to a report", PersonalChannel{Title: "Технологии", RecentPosts: []string{"Интимные видео украли у пользователей — новость https://news.example.com"}}, false},
+		{"music promotion with XXX title", PersonalChannel{Title: "Музыка", RecentPosts: []string{"XXX — мой новый альбом. Подписывайся https://music.example.com"}}, false},
+		{"adult-labeled music platform", PersonalChannel{Title: "Мой блог 18+", RecentPosts: []string{"OnlyFans 18+ — мой музыкальный блог. Подпишись https://music.example.com"}}, false},
+		{"women performing in music marked 18+", PersonalChannel{Title: "Музыка 18+", RecentPosts: []string{"Девушки выступают на концерте 18+. В нашем канале видео https://music.example.com"}}, false},
+		{"title alone", PersonalChannel{Title: "Закрытая коллекция 18+"}, false},
+		{"link alone", PersonalChannel{Title: "Закрытая коллекция 18+", RecentPosts: []string{"Мой канал https://t.me/+exampleInvite"}}, false},
+		{"no adult context", PersonalChannel{Title: "Личный канал", RecentPosts: []string{post}}, false},
+		{"no contact link", PersonalChannel{Title: "Коллекция 18+", RecentPosts: []string{"Горячие ролики. Доступ по заявке в канал"}}, false},
+		{"no invitation", PersonalChannel{Title: "Коллекция 18+", RecentPosts: []string{"Горячие ролики https://example.com"}}, false},
+		{"mixed personal posts", PersonalChannel{Title: "18+", RecentPosts: []string{post, "Новая песня и мои фотографии"}}, false},
+		{"unknown media", PersonalChannel{Title: "18+", RecentPosts: []string{post, ""}}, false},
+		{"personal description", PersonalChannel{Title: "18+", Description: "Мой дневник о музыке", RecentPosts: []string{post}}, false},
+		{"warning in post", PersonalChannel{Title: "18+", RecentPosts: []string{"Это спам, не переходите по ссылке! " + post}}, false},
+		{"warning in title", PersonalChannel{Title: "Разбор рекламы 18+", RecentPosts: []string{post}}, false},
+		{"warning in description", PersonalChannel{Title: "18+", Description: "Пример спама 18+, не переходите по ссылке", RecentPosts: []string{post}}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			signal := NewAdvertisingChannelDetector().Analyze(Profile{PersonalChannel: &tc.channel})
+			adult := signal.Score != nil && *signal.Score >= .98 && signal.Confidence != nil && *signal.Confidence >= .98 &&
+				slices.Contains(signal.ReasonCodes, ReasonConfirmedAdultAdvertisingChannel)
+			if adult != tc.wantAdult {
+				t.Fatalf("adult = %v, want %v; signal = %+v", adult, tc.wantAdult, signal)
+			}
+		})
+	}
+}
