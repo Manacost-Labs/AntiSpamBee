@@ -5,8 +5,17 @@ import (
 	"encoding/json"
 	"regexp"
 
+	"antispambee/internal/detection"
 	"antispambee/internal/events"
 )
+
+const ReasonMediaAnalysisUnavailable = "MEDIA_ANALYSIS_UNAVAILABLE"
+
+// NeedsModeratorReview excludes technical failures, which have their own alert.
+func (d Decision) NeedsModeratorReview() bool {
+	return d.AuthorizedAction == ActionReview && d.AuthorizationReason != detection.ReasonOpenRouterFailed &&
+		d.AuthorizationReason != ReasonMediaAnalysisUnavailable
+}
 
 type ReviewCase struct {
 	Target ActionTarget

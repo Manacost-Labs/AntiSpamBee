@@ -5,9 +5,49 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"antispambee/internal/detection"
 )
+
+func TestOpenRouterOutageDoesNotCreateCardsForOrdinaryMessages(t *testing.T) {
+	for _, test := range []struct {
+		text string
+		bio  string
+		want ActionType
+	}{
+		{"Не будет", "Играю в Hearthstone", ActionReview},
+		{"Ну пиздец", "", ActionAllow},
+		{"только 1 мод? обычно же по 2", "Люблю коллекционные игры", ActionReview},
+	} {
+		t.Run(test.text, func(t *testing.T) {
+			store := &recordingStore{}
+			primary := &contentAnalyzerStub{signal: detection.Signal{
+				Detector: detection.SemanticMessageDetector, Status: detection.StatusError,
+				ReasonCodes: []string{detection.ReasonOpenRouterFailed, detection.ReasonOpenRouterTemporarilyUnavailable},
+			}}
+			fallback := &semanticAdStub{signal: availableSignal("model.jev_advertising", .02, .95, 0)}
+			processor, err := NewProcessor(store, &profileFetcherStub{profile: detection.Profile{Bio: test.bio}}, detection.NewProfileDetector(),
+				WithContentAnalyzer(primary, &imageDownloaderStub{}, -1001), WithSemanticAnalyzer(fallback),
+				WithModerationOperations(-1001, []byte("key"), campaignStoreStub{}),
+				WithPolicyStore(&communityPolicyStub{policy: CommunityPolicy{ProtectionLevel: "STRICT", AutomaticActionsEnabled: true, ModeratorChatID: 91}}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			at := time.Now()
+			if test.bio != "" {
+				at = at.Add(-time.Minute)
+			}
+			payload := fmt.Sprintf(`{"message":{"message_id":7,"date":%d,"from":{"id":42},"chat":{"id":-1001,"type":"supergroup"},"text":%q}}`, at.Unix(), test.text)
+			if err := processor.Process(context.Background(), telegramEvent(payload)); err != nil {
+				t.Fatal(err)
+			}
+			if out := store.outcome; out.Decision.AuthorizedAction != test.want || out.QueueReview || len(out.Actions) != 0 {
+				t.Fatalf("outcome = %+v", out)
+			}
+		})
+	}
+}
 
 func TestCampaignIndicatorsMatchAliasesAndKeepDistinctLinks(t *testing.T) {
 	key := []byte("test-key")

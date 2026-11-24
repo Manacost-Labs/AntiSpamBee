@@ -281,6 +281,7 @@ func (p *Processor) Process(ctx context.Context, event events.TelegramUpdate) er
 	hasMessageContent := strings.TrimSpace(message.Text+message.Caption+message.OCRText) != ""
 	useSemantic := (p.semantic != nil || useContent) && !confirmedOffer
 	var checkedContent *detection.SemanticAdContent
+	textFallbackClear := false
 	addSemanticSignal := func() {
 		input := detection.SemanticAdContent{Message: message, Profile: profileContext}
 		if !useContent {
@@ -308,7 +309,10 @@ func (p *Processor) Process(ctx context.Context, event events.TelegramUpdate) er
 		if p.semantic != nil && slices.ContainsFunc(results, func(signal detection.Signal) bool {
 			return signal.Status == detection.StatusError
 		}) {
-			signals = append(signals, p.semantic.AnalyzeAdvertising(ctx, input))
+			fallback := p.semantic.AnalyzeAdvertising(ctx, input)
+			textFallbackClear = fallback.Status == detection.StatusAvailable && fallback.Score != nil && *fallback.Score >= 0 && *fallback.Score <= .10 &&
+				fileID == "" && profileContext.PersonalChannel == nil && strings.TrimSpace(profileContext.Bio) == ""
+			signals = append(signals, fallback)
 		}
 	}
 	if useSemantic && !confirmedEducationChannel {
@@ -374,7 +378,7 @@ func (p *Processor) Process(ctx context.Context, event events.TelegramUpdate) er
 		decisionInput.IsProtected = status == "creator" || status == "administrator"
 	}
 	decision := p.decisions.Decide(decisionInput)
-	if useContent && actionTarget.Kind == TargetMessage && decision.AuthorizedAction == ActionAllow {
+	if useContent && !textFallbackClear && actionTarget.Kind == TargetMessage && decision.AuthorizedAction == ActionAllow {
 		for _, signal := range signals {
 			if signal.Detector != detection.SemanticMessageDetector || signal.Status != detection.StatusError {
 				continue
@@ -392,10 +396,10 @@ func (p *Processor) Process(ctx context.Context, event events.TelegramUpdate) er
 	decision, confirmation := p.verifyAdvertisingAction(ctx, decision, decisionInput, checkedContent)
 	signals = append(signals, confirmation...)
 	isProtected = decisionInput.IsProtected
-	if ocrFailureSignal != nil && decision.RiskScore < 0.90 {
+	if ocrFailureSignal != nil && decision.RiskScore < 0.90 && decision.AuthorizedAction == ActionAllow {
 		decision.RecommendedAction = ActionReview
 		decision.AuthorizedAction = ActionReview
-		decision.AuthorizationReason = ReasonInsufficientEvidence
+		decision.AuthorizationReason = ReasonMediaAnalysisUnavailable
 	}
 	if len(indicators) > 0 && !isProtected {
 		kinds, err := p.campaigns.ObserveCampaign(ctx, event.TenantID, actionTarget, indicators, isAutomaticAction(decision.AuthorizedAction))
@@ -438,7 +442,7 @@ func (p *Processor) Process(ctx context.Context, event events.TelegramUpdate) er
 		Decision:    decision,
 		Actions:     actions,
 		Evidence:    evidence,
-		QueueReview: operations && decision.AuthorizedAction == ActionReview,
+		QueueReview: operations && decision.NeedsModeratorReview(),
 	}); err != nil {
 		return fmt.Errorf("record terminal moderation state: %w", err)
 	}

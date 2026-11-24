@@ -9,6 +9,47 @@ import (
 	"antispambee/internal/moderation"
 )
 
+func TestTechnicalOutageStaysInMonitoringAndCannotBeActedOnAsSpam(t *testing.T) {
+	store, pool := commandTestStore(t)
+	ctx := context.Background()
+	const group, moderator = int64(-100609993), int64(70008)
+	event := commandTestEvent(t, 901091)
+	if _, err := pool.Exec(ctx, `DELETE FROM moderation_events WHERE event_id=$1`, event.EventID); err != nil {
+		t.Fatal(err)
+	}
+	if err := setCommunityModerator(ctx, pool, event.TenantID, group, moderator); err != nil {
+		t.Fatal(err)
+	}
+	outcome := moderation.Outcome{
+		State: moderation.ProcessedReview, QueueReview: true,
+		Decision: moderation.Decision{RecommendedAction: moderation.ActionReview, AuthorizedAction: moderation.ActionReview, AuthorizationReason: detection.ReasonOpenRouterFailed},
+		Evidence: &moderation.Evidence{Target: moderation.ActionTarget{Kind: moderation.TargetMessage, ChatID: group, UserID: 44, MessageID: 62},
+			Policy: moderation.CommunityPolicy{ModeratorChatID: moderator}},
+		Signals: []detection.Signal{{SchemaVersion: "1", Detector: detection.SemanticMessageDetector, DetectorVersion: "outage-test", Category: "spam.advertising",
+			Status: detection.StatusError, Severity: detection.SeverityInfo, ReasonCodes: []string{detection.ReasonOpenRouterFailed}, CreatedAt: time.Now()}},
+	}
+	if err := store.RecordTerminal(ctx, event, outcome); err != nil {
+		t.Fatal(err)
+	}
+	var cards int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM moderation_reviews WHERE event_id=$1`, event.EventID).Scan(&cards); err != nil || cards != 0 {
+		t.Fatalf("technical review generated cards=%d err=%v", cards, err)
+	}
+	status, err := store.OperationsStatus(ctx, group)
+	if err != nil || status.ModelErrors != 1 {
+		t.Fatalf("operations status=%+v err=%v", status, err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO moderation_reviews(event_id) VALUES ($1)`, event.EventID); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, err := store.PendingReviewForModerator(ctx, event.TenantID, event.EventID, moderator); err != nil || found {
+		t.Fatalf("old technical card still active=%t err=%v", found, err)
+	}
+	if accepted, err := store.ResolveReview(ctx, event.TenantID, event.EventID, moderator, true); err != nil || accepted {
+		t.Fatalf("old technical card can delete=%t err=%v", accepted, err)
+	}
+}
+
 func TestReviewDecisionPersistsLabelAndQueuesOnlyOneManualDelete(t *testing.T) {
 	store, pool := commandTestStore(t)
 	ctx := context.Background()

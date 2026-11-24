@@ -48,7 +48,7 @@ const (
 	ReasonConfirmedAdultAdvertisingChannel = detection.ReasonConfirmedAdultAdvertisingChannel
 	ReasonConfirmedAdultChannel            = detection.ReasonConfirmedAdultChannel
 	ReasonConfirmedFraudChannel            = detection.ReasonConfirmedFraudChannel
-	DecisionPolicyVersion                  = "message-evidence-v12"
+	DecisionPolicyVersion                  = "message-evidence-v13"
 )
 
 // ActionTarget contains stable Telegram identifiers needed by an action worker.

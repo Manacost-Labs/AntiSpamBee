@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	"antispambee/internal/detection"
 	"antispambee/internal/events"
 	"antispambee/internal/moderation"
 	"github.com/jackc/pgx/v5"
@@ -13,7 +14,7 @@ import (
 
 func enqueueReview(ctx context.Context, tx pgx.Tx, event events.TelegramUpdate, outcome moderation.Outcome) error {
 	evidence := outcome.Evidence
-	if !outcome.QueueReview || evidence == nil || evidence.Target.Kind != moderation.TargetMessage ||
+	if !outcome.QueueReview || !outcome.Decision.NeedsModeratorReview() || evidence == nil || evidence.Target.Kind != moderation.TargetMessage ||
 		evidence.Target.ChatID == 0 || evidence.Target.UserID <= 0 || evidence.Target.MessageID <= 0 || evidence.Protected {
 		return nil
 	}
@@ -71,9 +72,11 @@ func (s *Store) PendingReviewForModerator(ctx context.Context, tenant, eventID s
 	var review moderation.ReviewCase
 	err := s.pool.QueryRow(ctx, `SELECT e.chat_id, e.message_id, (e.snapshot->'Target'->>'UserID')::bigint
 		FROM moderation_reviews r JOIN moderation_evidence e USING(event_id)
+		JOIN moderation_decisions d USING(event_id)
 		JOIN community_policies p ON p.tenant_id=e.tenant_id AND p.chat_id=e.chat_id
-		WHERE e.tenant_id=$1 AND e.event_id=$2 AND e.expires_at>now() AND r.verdict IS NULL AND p.moderator_chat_id=$3`,
-		tenant, eventID, moderatorID).Scan(&review.Target.ChatID, &review.Target.MessageID, &review.Target.UserID)
+		WHERE e.tenant_id=$1 AND e.event_id=$2 AND e.expires_at>now() AND r.verdict IS NULL AND p.moderator_chat_id=$3
+		AND d.authorization_reason NOT IN ($4,$5)`, tenant, eventID, moderatorID,
+		detection.ReasonOpenRouterFailed, moderation.ReasonMediaAnalysisUnavailable).Scan(&review.Target.ChatID, &review.Target.MessageID, &review.Target.UserID)
 	if errorsIsNoRows(err) {
 		return moderation.ReviewCase{}, false, nil
 	}
@@ -96,10 +99,12 @@ func (s *Store) ResolveReview(ctx context.Context, tenant, eventID string, moder
 	}
 	var chatID, messageID, userID int64
 	err = tx.QueryRow(ctx, `UPDATE moderation_reviews r SET verdict=$4,reviewer_id=$3,reviewed_at=now()
-		FROM moderation_evidence e JOIN community_policies p ON p.tenant_id=e.tenant_id AND p.chat_id=e.chat_id
+		FROM moderation_evidence e JOIN moderation_decisions d USING(event_id)
+		JOIN community_policies p ON p.tenant_id=e.tenant_id AND p.chat_id=e.chat_id
 		WHERE r.event_id=e.event_id AND e.event_id=$2 AND e.tenant_id=$1 AND e.expires_at>now()
-		AND p.moderator_chat_id=$3 AND r.verdict IS NULL
-		RETURNING e.chat_id,e.message_id,(e.snapshot->'Target'->>'UserID')::bigint`, tenant, eventID, moderatorID, verdict).Scan(&chatID, &messageID, &userID)
+		AND p.moderator_chat_id=$3 AND r.verdict IS NULL AND d.authorization_reason NOT IN ($5,$6)
+		RETURNING e.chat_id,e.message_id,(e.snapshot->'Target'->>'UserID')::bigint`, tenant, eventID, moderatorID, verdict,
+		detection.ReasonOpenRouterFailed, moderation.ReasonMediaAnalysisUnavailable).Scan(&chatID, &messageID, &userID)
 	if errorsIsNoRows(err) {
 		return false, nil
 	}
