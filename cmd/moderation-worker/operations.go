@@ -36,7 +36,6 @@ func operationalAlerts(queueSlow, queueUnavailable bool, stats postgresstore.Ope
 func monitorOperations(ctx context.Context, chatID int64, consumer jetstream.Consumer, store *postgresstore.Store, telegram *telegramapi.Client, metrics *workerMetrics) {
 	ticker := time.NewTicker(20 * time.Second)
 	defer ticker.Stop()
-	next := make(map[string]time.Time)
 	var slowSamples, unavailableSamples int
 	var seenModelRetries uint64
 	for {
@@ -78,24 +77,28 @@ func monitorOperations(ctx context.Context, chatID int64, consumer jetstream.Con
 			continue
 		}
 		for _, alert := range alerts {
-			now := time.Now()
-			if now.Before(next[alert.kind]) {
+			reservedUntil, err := store.ReserveOperationsAlert(poll, chatID, alert.kind, 15*time.Minute)
+			if err != nil {
+				slog.Warn("cannot reserve moderation operation alert", "kind", alert.kind)
 				continue
 			}
-			err := telegram.SendMessage(poll, stats.ModeratorID, "AntiSpamBee · "+alert.text)
+			if reservedUntil.IsZero() {
+				continue
+			}
+			err = telegram.SendMessage(poll, stats.ModeratorID, "AntiSpamBee · "+alert.text)
 			if err == nil {
-				next[alert.kind] = now.Add(15 * time.Minute)
 				if alert.kind == "classification" {
 					seenModelRetries = modelRetries
 				}
 				continue
 			}
-			delay := time.Minute
 			var apiErr *telegramapi.APIError
-			if errors.As(err, &apiErr) && apiErr.RetryAfter > delay {
-				delay = apiErr.RetryAfter
+			if errors.As(err, &apiErr) && apiErr.ErrorCode == 429 {
+				delay := max(time.Minute, apiErr.RetryAfter)
+				if err := store.RescheduleOperationsAlert(poll, chatID, alert.kind, reservedUntil, delay); err != nil {
+					slog.Warn("cannot reschedule moderation operation alert", "kind", alert.kind)
+				}
 			}
-			next[alert.kind] = now.Add(delay)
 			slog.Warn("cannot deliver moderation operation alert", "kind", alert.kind)
 		}
 		cancel()

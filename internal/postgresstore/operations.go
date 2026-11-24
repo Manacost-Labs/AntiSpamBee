@@ -1,6 +1,9 @@
 package postgresstore
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 type OperationsStatus struct {
 	ModeratorID     int64
@@ -21,4 +24,23 @@ func (s *Store) OperationsStatus(ctx context.Context, chatID int64) (OperationsS
 			  OR EXISTS (SELECT 1 FROM message_activity a WHERE a.event_id=s.event_id AND a.chat_id=$1)))`, chatID).
 		Scan(&status.ModeratorID, &status.FailedActions, &status.RetryingActions, &status.ModelErrors)
 	return status, err
+}
+
+func (s *Store) ReserveOperationsAlert(ctx context.Context, chatID int64, kind string, cooldown time.Duration) (time.Time, error) {
+	var reservedUntil time.Time
+	err := s.pool.QueryRow(ctx, `INSERT INTO moderation_operation_alerts (chat_id, kind, next_available_at)
+		VALUES ($1, $2, now()+$3*interval '1 second')
+		ON CONFLICT (chat_id, kind) DO UPDATE SET next_available_at=EXCLUDED.next_available_at
+		WHERE moderation_operation_alerts.next_available_at<=now()
+		RETURNING next_available_at`, chatID, kind, cooldown.Seconds()).Scan(&reservedUntil)
+	if errorsIsNoRows(err) {
+		return time.Time{}, nil
+	}
+	return reservedUntil, err
+}
+
+func (s *Store) RescheduleOperationsAlert(ctx context.Context, chatID int64, kind string, reservedUntil time.Time, delay time.Duration) error {
+	_, err := s.pool.Exec(ctx, `UPDATE moderation_operation_alerts SET next_available_at=now()+$4*interval '1 second'
+		WHERE chat_id=$1 AND kind=$2 AND next_available_at=$3`, chatID, kind, reservedUntil, delay.Seconds())
+	return err
 }

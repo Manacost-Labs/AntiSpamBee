@@ -151,6 +151,9 @@ func TestAnalyzeContentLive(t *testing.T) {
 		{name: "profile professional", text: "Какая колода лучше?", profile: detection.Profile{Bio: "Звукорежиссёр и музыкант, люблю подкасты"}},
 		{name: "scam warning", text: "Осторожно, это спам! Мне прислали: Сведу ваш подкаст за 12 евро, заказывайте в личке."},
 		{name: "card pack discussion", text: "Такой бред, что дают карты из события, если ты просто купил пак. Так они ещё и срезают этот срок до одной недели"},
+		{name: "short reply", text: "Не будет"},
+		{name: "frustration", text: "Ну пиздец"},
+		{name: "moderator count", text: "только 1 мод? обычно же по 2"},
 		{name: "image only", image: image, want: [2]bool{true, false}},
 		{name: "profile image only", text: "Люблю играть на магах", profileImage: image,
 			profile: detection.Profile{PersonalChannel: &detection.PersonalChannel{

@@ -9,6 +9,59 @@ import (
 	"antispambee/internal/moderation"
 )
 
+func TestOperationsAlertCooldownSurvivesWorkerRestart(t *testing.T) {
+	store, pool := commandTestStore(t)
+	ctx := context.Background()
+	const group = int64(-100609994)
+	const kind = "classification"
+	t.Cleanup(func() { _, _ = pool.Exec(ctx, `DELETE FROM moderation_operation_alerts WHERE chat_id=$1`, group) })
+
+	// Separate workers can see the same incident at the same time.
+	restarted := &Store{pool: pool}
+	type reservation struct {
+		until time.Time
+		err   error
+	}
+	results := make(chan reservation, 2)
+	for _, worker := range []*Store{store, restarted} {
+		go func() {
+			until, err := worker.ReserveOperationsAlert(ctx, group, kind, 15*time.Minute)
+			results <- reservation{until, err}
+		}()
+	}
+	var reserved time.Time
+	for range 2 {
+		result := <-results
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		if !result.until.IsZero() {
+			if !reserved.IsZero() {
+				t.Fatal("both workers reserved the same alert")
+			}
+			reserved = result.until
+		}
+	}
+	if reserved.IsZero() {
+		t.Fatal("no worker reserved the alert")
+	}
+	if until, err := restarted.ReserveOperationsAlert(ctx, group, "queue_slow", 15*time.Minute); err != nil || until.IsZero() {
+		t.Fatalf("another alert type was blocked: until=%v err=%v", until, err)
+	}
+	if err := restarted.RescheduleOperationsAlert(ctx, group, kind, reserved.Add(-time.Minute), 0); err != nil {
+		t.Fatal(err)
+	}
+	if until, err := restarted.ReserveOperationsAlert(ctx, group, kind, 15*time.Minute); err != nil || !until.IsZero() {
+		t.Fatalf("a stale reservation changed the cooldown: until=%v err=%v", until, err)
+	}
+	if err := store.RescheduleOperationsAlert(ctx, group, kind, reserved, 0); err != nil {
+		t.Fatal(err)
+	}
+	if until, err := restarted.ReserveOperationsAlert(ctx, group, kind, 15*time.Minute); err != nil || until.IsZero() {
+		t.Fatalf("alert not reserved after rescheduled cooldown: until=%v err=%v", until, err)
+	}
+}
+
 func TestTechnicalOutageStaysInMonitoringAndCannotBeActedOnAsSpam(t *testing.T) {
 	store, pool := commandTestStore(t)
 	ctx := context.Background()
